@@ -32,7 +32,7 @@ from PyQt6.QtCore import (
     QTimer,
 )
 from PyQt6.QtGui import QDesktopServices, QIcon, QColor
-from PyQt6.QtWidgets import QApplication, QMainWindow
+from PyQt6.QtWidgets import QApplication, QMainWindow, QMessageBox
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineSettings
 from PyQt6.QtWebChannel import QWebChannel
@@ -99,6 +99,11 @@ RESOURCE_DIR = get_resource_dir()
 LOGO_PATH = os.path.join(RESOURCE_DIR, "assets", "SYS IO - Logo.ico")
 LOGO_URI = QUrl.fromLocalFile(LOGO_PATH).toString() if os.path.exists(LOGO_PATH) else ""
 BASE_URL = QUrl.fromLocalFile(BASE_DIR + os.sep)
+
+REQUIRED_ASSETS = {
+    "SYS IO - Logo.ico": LOGO_PATH,
+}
+UPDATE_LATEST_RELEASE_URL = f"https://github.com/{UPDATE_REPO}/releases/latest"
 
 
 def get_settings_dir():
@@ -167,6 +172,33 @@ def show_admin_required_dialog():
         )
     except Exception:
         pass
+
+
+def get_missing_assets():
+    return [name for name, path in REQUIRED_ASSETS.items() if not os.path.exists(path)]
+
+
+def show_missing_assets_dialog(missing_names):
+    listed = "\n".join(f"- {name}" for name in missing_names)
+    message = (
+        f"{APP_NAME} is missing required files:\n\n{listed}\n\n"
+        "The installation appears to be incomplete or damaged.\n"
+        "It is recommended to reinstall the app using the latest release (.rar) from GitHub."
+    )
+    box = QMessageBox()
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setWindowTitle(APP_NAME)
+    box.setText(message)
+    if os.path.exists(LOGO_PATH):
+        box.setWindowIcon(QIcon(LOGO_PATH))
+    open_button = box.addButton("Open Latest Release", QMessageBox.ButtonRole.ActionRole)
+    box.addButton("Continue Anyway", QMessageBox.ButtonRole.RejectRole)
+    box.exec()
+    if box.clickedButton() == open_button:
+        try:
+            QDesktopServices.openUrl(QUrl(UPDATE_LATEST_RELEASE_URL))
+        except Exception:
+            pass
 
 
 class _SHELLEXECUTEINFOW(ctypes.Structure):
@@ -1789,6 +1821,20 @@ body.window-maximized #boot-screen {
 }
 .update-changelog.show { display: block; }
 .update-changelog li { margin: 2px 0; }
+.update-changelog strong { color: var(--fg); font-weight: 700; }
+.update-changelog em { color: var(--fg); font-style: italic; }
+.update-changelog del { opacity: 0.7; }
+.update-changelog code {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-family: "Consolas", "SFMono-Regular", Menlo, monospace;
+  font-size: 11.5px;
+  color: var(--fg);
+}
+.update-changelog a { color: var(--accent); text-decoration: none; }
+.update-changelog a:hover { text-decoration: underline; }
 .update-progress {
   display: none;
   width: 100%;
@@ -2673,6 +2719,27 @@ function formatBytes(num) {
   return `${(num / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function escapeHtml(text) {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function formatInlineMarkdown(text) {
+  let formatted = escapeHtml(String(text == null ? "" : text));
+  formatted = formatted.replace(/`([^`]+)`/g, "<code>$1</code>");
+  formatted = formatted.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  formatted = formatted.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  formatted = formatted.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+  formatted = formatted.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+  formatted = formatted.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+  formatted = formatted.replace(/_([^_]+)_/g, "<em>$1</em>");
+  return formatted;
+}
+
 function startUpdateCheck() {
   if (updateCheckState.status === "checking") return;
   updateDownloadState = { status: "idle", received: 0, total: 0 };
@@ -2774,7 +2841,7 @@ function applyUpdateCheckState() {
     if (updateCheckState.whatsNew && updateCheckState.whatsNew.length > 0) {
       updateCheckState.whatsNew.forEach((item) => {
         const li = document.createElement("li");
-        li.textContent = item;
+        li.innerHTML = formatInlineMarkdown(item);
         updateChangelogEl.appendChild(li);
       });
       updateChangelogEl.classList.add("show");
@@ -2963,6 +3030,10 @@ def main():
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
     app.setOrganizationName(APP_AUTHOR)
+
+    missing_assets = get_missing_assets()
+    if missing_assets:
+        show_missing_assets_dialog(missing_assets)
 
     window = MainWindow()
     window.show()
