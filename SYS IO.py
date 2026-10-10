@@ -15,6 +15,7 @@ import urllib.request
 import uuid
 import subprocess
 import threading
+import time
 from datetime import datetime
 
 import psutil
@@ -77,7 +78,7 @@ APP_VERSION = "0.0.3 (Beta)"
 APP_AUTHOR = "Arch"
 APP_AUTHOR_HANDLE = "@xarchfx"
 APP_AUTHOR_URL = "https://xarchfx.lol"
-UPDATE_REPO = "xarchfx/sys-io"
+UPDATE_REPO = "xarchfx/SYS-IO"
 UPDATE_RELEASES_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases"
 UPDATE_TAGS_PAGE_URL = f"https://github.com/{UPDATE_REPO}/tags"
 
@@ -326,6 +327,15 @@ def wmi_all(conn, class_name):
         return []
 
 
+def wmi_attr(obj, attr, fallback="N/A"):
+    if obj is None:
+        return fallback
+    try:
+        return safe(getattr(obj, attr, None), fallback)
+    except Exception:
+        return fallback
+
+
 def get_gpu_names(conn=None):
     names = []
     conn = conn or wmi_connect()
@@ -382,14 +392,8 @@ def normalize_vram_bytes(adapter_ram):
 
 
 def get_cpu_name(conn=None):
-    name = safe(platform.processor())
     cpu = wmi_first(conn or wmi_connect(), "Win32_Processor")
-    if cpu is not None:
-        try:
-            name = safe(cpu.Name)
-        except Exception:
-            pass
-    return name
+    return wmi_attr(cpu, "Name", safe(platform.processor()))
 
 
 def get_overview():
@@ -397,21 +401,9 @@ def get_overview():
     cpu_name = get_cpu_name(conn)
     gpu_names = get_gpu_names(conn)
     board = wmi_first(conn, "Win32_BaseBoard")
-    board_name = "N/A"
-    if board is not None:
-        try:
-            board_name = safe(board.Product)
-        except Exception:
-            pass
+    board_name = wmi_attr(board, "Product")
     os_info = wmi_first(conn, "Win32_OperatingSystem")
-    os_name = "N/A"
-    if os_info is not None:
-        try:
-            os_name = safe(os_info.Caption)
-        except Exception:
-            pass
-    if os_name == "N/A":
-        os_name = safe(f"{platform.system()} {platform.release()}")
+    os_name = wmi_attr(os_info, "Caption", safe(f"{platform.system()} {platform.release()}"))
     boot_ts = psutil.boot_time()
     vm = psutil.virtual_memory()
     total_cpu, _ = get_cpu_usage_snapshot()
@@ -458,14 +450,14 @@ def get_os_info():
     }
     info = wmi_first(wmi_connect(), "Win32_OperatingSystem")
     if info is not None:
+        general["OS Name"] = wmi_attr(info, "Caption", general["OS Name"])
+        general["Build"] = wmi_attr(info, "BuildNumber", general["Build"])
         try:
-            general["OS Name"] = safe(info.Caption)
-            general["Build"] = safe(info.BuildNumber)
             general["Install Date"] = safe(format_wmi_datetime(info.InstallDate))
-            system["System Drive"] = safe(info.SystemDrive)
-            system["Serial Number"] = safe(info.SerialNumber)
         except Exception:
             pass
+        system["System Drive"] = wmi_attr(info, "SystemDrive")
+        system["Serial Number"] = wmi_attr(info, "SerialNumber")
     return {"General": general, "System": system}
 
 
@@ -483,19 +475,15 @@ def get_motherboard():
     }
     conn = wmi_connect()
     board = wmi_first(conn, "Win32_BaseBoard")
-    if board is not None:
-        try:
-            general["Manufacturer"] = safe(board.Manufacturer)
-            general["Product"] = safe(board.Product)
-            general["Version"] = safe(board.Version)
-            general["Serial Number"] = safe(board.SerialNumber)
-        except Exception:
-            pass
+    general["Manufacturer"] = wmi_attr(board, "Manufacturer")
+    general["Product"] = wmi_attr(board, "Product")
+    general["Version"] = wmi_attr(board, "Version")
+    general["Serial Number"] = wmi_attr(board, "SerialNumber")
     bios_info = wmi_first(conn, "Win32_BIOS")
+    bios["BIOS Vendor"] = wmi_attr(bios_info, "Manufacturer")
+    bios["BIOS Version"] = wmi_attr(bios_info, "SMBIOSBIOSVersion")
     if bios_info is not None:
         try:
-            bios["BIOS Vendor"] = safe(bios_info.Manufacturer)
-            bios["BIOS Version"] = safe(bios_info.SMBIOSBIOSVersion)
             bios["BIOS Release Date"] = safe(format_wmi_datetime(bios_info.ReleaseDate))
         except Exception:
             pass
@@ -505,23 +493,20 @@ def get_motherboard():
 def get_processor():
     conn = wmi_connect()
     cpu = wmi_first(conn, "Win32_Processor")
-    manufacturer = "N/A"
-    socket_name = "N/A"
-    threads = "N/A"
+    manufacturer = wmi_attr(cpu, "Manufacturer")
+    socket_name = wmi_attr(cpu, "SocketDesignation")
+    threads = wmi_attr(cpu, "ThreadCount")
     l1_bytes = 0
     l2_bytes = None
     l3_bytes = None
     if cpu is not None:
         try:
-            manufacturer = safe(cpu.Manufacturer)
-            socket_name = safe(cpu.SocketDesignation)
-            threads = safe(cpu.ThreadCount)
-            try:
-                for cache in wmi_all(conn, "Win32_CacheMemory"):
-                    if int(cache.Level) == 3 and cache.MaxCacheSize:
-                        l1_bytes += int(cache.MaxCacheSize) * 1024
-            except Exception:
-                l1_bytes = 0
+            for cache in wmi_all(conn, "Win32_CacheMemory"):
+                if int(cache.Level) == 3 and cache.MaxCacheSize:
+                    l1_bytes += int(cache.MaxCacheSize) * 1024
+        except Exception:
+            l1_bytes = 0
+        try:
             l2_bytes = cpu.L2CacheSize * 1024 if cpu.L2CacheSize else None
             l3_bytes = cpu.L3CacheSize * 1024 if cpu.L3CacheSize else None
         except Exception:
@@ -554,16 +539,19 @@ def get_graphics():
         multiple = len(gpus) > 1
         for idx, gpu in enumerate(gpus):
             label = f"GPU {idx + 1}" if multiple else "GPU"
-            vram = normalize_vram_bytes(gpu.AdapterRAM)
-            if idx < len(registry_vram) and registry_vram[idx] > (vram or 0):
-                vram = registry_vram[idx]
-            groups[label] = {
-                "Name": safe(gpu.Name),
-                "VRAM": bytes_to_readable(vram) if vram else "N/A",
-                "Driver Version": safe(gpu.DriverVersion),
-                "Resolution": f"{safe(gpu.CurrentHorizontalResolution)} x {safe(gpu.CurrentVerticalResolution)}",
-                "Refresh Rate": f"{safe(gpu.CurrentRefreshRate)} Hz",
-            }
+            try:
+                vram = normalize_vram_bytes(gpu.AdapterRAM)
+                if idx < len(registry_vram) and registry_vram[idx] > (vram or 0):
+                    vram = registry_vram[idx]
+                groups[label] = {
+                    "Name": safe(gpu.Name),
+                    "VRAM": bytes_to_readable(vram) if vram else "N/A",
+                    "Driver Version": safe(gpu.DriverVersion),
+                    "Resolution": f"{safe(gpu.CurrentHorizontalResolution)} x {safe(gpu.CurrentVerticalResolution)}",
+                    "Refresh Rate": f"{safe(gpu.CurrentRefreshRate)} Hz",
+                }
+            except Exception:
+                continue
     except Exception:
         pass
     if not groups:
@@ -583,9 +571,9 @@ def get_memory():
         "Swap Used": bytes_to_readable(sm.used),
     }
     groups = {"General": general}
-    try:
-        memory_type_labels = {20: "DDR", 21: "DDR2", 24: "DDR3", 26: "DDR4", 34: "DDR5"}
-        for idx, mod in enumerate(wmi_all(wmi_connect(), "Win32_PhysicalMemory")):
+    memory_type_labels = {20: "DDR", 21: "DDR2", 24: "DDR3", 26: "DDR4", 34: "DDR5"}
+    for idx, mod in enumerate(wmi_all(wmi_connect(), "Win32_PhysicalMemory")):
+        try:
             groups[f"Module {idx + 1}"] = {
                 "Capacity": bytes_to_readable(int(mod.Capacity)) if mod.Capacity else "N/A",
                 "Speed": f"{safe(mod.Speed)} MHz",
@@ -593,8 +581,8 @@ def get_memory():
                 "Manufacturer": safe(mod.Manufacturer),
                 "Part Number": safe(mod.PartNumber),
             }
-    except Exception:
-        pass
+        except Exception:
+            continue
     return groups
 
 
@@ -624,8 +612,9 @@ def get_storage():
             usage = psutil.disk_usage(part.mountpoint)
         except Exception:
             continue
-        key = part.device.rstrip("\\").rstrip(":").upper()
-        label = f"Drive {part.device.rstrip(chr(92))}"
+        device_name = part.device.rstrip("\\")
+        key = device_name.rstrip(":").upper()
+        label = f"Drive {device_name}"
         drives[key] = {
             "label": label,
             "disk": {},
@@ -640,10 +629,10 @@ def get_storage():
         drive_order.append(key)
 
     unmatched = []
-    try:
-        media_types = get_disk_media_types()
-        unmatched_index = 1
-        for disk in wmi_all(wmi_connect(), "Win32_DiskDrive"):
+    media_types = get_disk_media_types()
+    unmatched_index = 1
+    for disk in wmi_all(wmi_connect(), "Win32_DiskDrive"):
+        try:
             size = disk.Size
             disk_details = {
                 "Disk Model": safe(disk.Model),
@@ -653,21 +642,21 @@ def get_storage():
                 "Health Status": safe(disk.Status),
                 "Serial Number": safe(disk.SerialNumber),
             }
-            matched = False
-            try:
-                for partition in disk.associators("Win32_DiskDriveToDiskPartition"):
-                    for logical in partition.associators("Win32_LogicalDiskToPartition"):
-                        key = safe(logical.DeviceID).rstrip(":").upper()
-                        if key in drives:
-                            drives[key]["disk"] = disk_details
-                            matched = True
-            except Exception:
-                pass
-            if not matched:
-                unmatched.append((f"Disk {unmatched_index} ({safe(disk.Model)})", disk_details))
-                unmatched_index += 1
-    except Exception:
-        pass
+        except Exception:
+            continue
+        matched = False
+        try:
+            for partition in disk.associators("Win32_DiskDriveToDiskPartition"):
+                for logical in partition.associators("Win32_LogicalDiskToPartition"):
+                    logical_key = safe(logical.DeviceID).rstrip(":").upper()
+                    if logical_key in drives:
+                        drives[logical_key]["disk"] = disk_details
+                        matched = True
+        except Exception:
+            pass
+        if not matched:
+            unmatched.append((f"Disk {unmatched_index} ({safe(disk.Model)})", disk_details))
+            unmatched_index += 1
 
     for key in drive_order:
         entry = drives[key]
@@ -681,13 +670,14 @@ def get_storage():
 
 
 _nvidia_smi_available = None
+_nvidia_smi_lock = threading.Lock()
+_nvidia_smi_cache = {"timestamp": 0.0, "temps": {}}
+NVIDIA_SMI_CACHE_SECONDS = 2.0
 
 
-def get_nvidia_gpu_temps():
-    global _nvidia_smi_available
+def _query_nvidia_gpu_temps():
     gpu_temps = {}
-    if _nvidia_smi_available is False:
-        return gpu_temps
+    global _nvidia_smi_available
     try:
         run_kwargs = {"capture_output": True, "text": True, "timeout": 3}
         if IS_WINDOWS:
@@ -707,6 +697,19 @@ def get_nvidia_gpu_temps():
     except Exception:
         pass
     return gpu_temps
+
+
+def get_nvidia_gpu_temps():
+    if _nvidia_smi_available is False:
+        return {}
+    now = time.monotonic()
+    with _nvidia_smi_lock:
+        if now - _nvidia_smi_cache["timestamp"] < NVIDIA_SMI_CACHE_SECONDS:
+            return dict(_nvidia_smi_cache["temps"])
+        temps = _query_nvidia_gpu_temps()
+        _nvidia_smi_cache["timestamp"] = now
+        _nvidia_smi_cache["temps"] = temps
+        return dict(temps)
 
 
 def get_temperatures():
@@ -834,35 +837,17 @@ def get_hardware_ids():
     groups = {"General": {"MAC Address": mac, "Machine GUID": get_machine_guid()}}
     conn = wmi_connect()
     cpu = wmi_first(conn, "Win32_Processor")
-    if cpu is not None:
-        try:
-            groups["Processor"] = {"Processor ID": safe(cpu.ProcessorId)}
-        except Exception:
-            pass
+    groups["Processor"] = {"Processor ID": wmi_attr(cpu, "ProcessorId")}
     board = wmi_first(conn, "Win32_BaseBoard")
-    if board is not None:
-        try:
-            groups["Motherboard"] = {"Motherboard Serial": safe(board.SerialNumber)}
-        except Exception:
-            pass
+    groups["Motherboard"] = {"Motherboard Serial": wmi_attr(board, "SerialNumber")}
     bios = wmi_first(conn, "Win32_BIOS")
-    if bios is not None:
-        try:
-            groups["BIOS"] = {"BIOS Serial": safe(bios.SerialNumber)}
-        except Exception:
-            pass
+    groups["BIOS"] = {"BIOS Serial": wmi_attr(bios, "SerialNumber")}
     product = wmi_first(conn, "Win32_ComputerSystemProduct")
-    if product is not None:
-        try:
-            groups["System"] = {"System UUID": safe(product.UUID)}
-        except Exception:
-            pass
     os_info = wmi_first(conn, "Win32_OperatingSystem")
-    if os_info is not None:
-        try:
-            groups.setdefault("System", {})["Windows Product ID"] = safe(os_info.SerialNumber)
-        except Exception:
-            pass
+    groups["System"] = {
+        "System UUID": wmi_attr(product, "UUID"),
+        "Windows Product ID": wmi_attr(os_info, "SerialNumber"),
+    }
     try:
         disk_group = {}
         for idx, disk in enumerate(wmi_all(conn, "Win32_DiskDrive")):
@@ -911,7 +896,7 @@ def parse_strict_tag_version(name):
     return tuple(int(part) for part in match.groups())
 
 
-WHATS_NEW_HEADING_RE = re.compile(r"^#{1,6}[^\n]*what changed[^\n]*$", re.IGNORECASE | re.MULTILINE)
+WHATS_NEW_HEADING_RE = re.compile(r"^#{1,6}[^\n]*what.?s?\s+changed[^\n]*$", re.IGNORECASE | re.MULTILINE)
 
 
 def extract_whats_new(body):
@@ -999,12 +984,14 @@ class InfoWorker(QThread):
         self.category = category
 
     def run(self):
+        com_module = None
         if IS_WINDOWS:
             try:
                 import pythoncom
                 pythoncom.CoInitialize()
+                com_module = pythoncom
             except Exception:
-                pass
+                com_module = None
         try:
             func = PROVIDERS.get(self.category)
             result = func() if func else {}
@@ -1012,10 +999,9 @@ class InfoWorker(QThread):
         except Exception as exc:
             self.failed.emit(self.category, str(exc))
         finally:
-            if IS_WINDOWS:
+            if com_module is not None:
                 try:
-                    import pythoncom
-                    pythoncom.CoUninitialize()
+                    com_module.CoUninitialize()
                 except Exception:
                     pass
 
@@ -1055,7 +1041,7 @@ class UpdateCheckWorker(QThread):
         current_tuple = parse_version_tuple(current)
         latest_tuple = parse_version_tuple(latest)
         if current_tuple is not None and latest_tuple is not None:
-            available = latest_tuple != current_tuple
+            available = latest_tuple > current_tuple
         else:
             available = latest.strip().lstrip("vV") != current.strip().lstrip("vV")
         asset = find_exe_asset(release)
@@ -1101,6 +1087,11 @@ class UpdateDownloadWorker(QThread):
                         self.progress.emit(received, total)
             self.finishedDownload.emit(self.target_path)
         except Exception as exc:
+            try:
+                if os.path.exists(self.target_path):
+                    os.remove(self.target_path)
+            except Exception:
+                pass
             self.failed.emit(str(exc))
 
 
@@ -2499,7 +2490,7 @@ function renderError(message) {
   const { section, subgrid } = createGroupSection();
   const card = document.createElement("div");
   card.className = "card error-card";
-  card.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i><span>${message}</span>`;
+  card.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i><span>${escapeHtml(String(message == null ? "" : message))}</span>`;
   subgrid.appendChild(card);
   grid.appendChild(section);
 }
