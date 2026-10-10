@@ -73,7 +73,7 @@ def get_cpu_usage_snapshot():
 
 
 APP_NAME = "SYS IO"
-APP_VERSION = "0.0.2 (Beta)"
+APP_VERSION = "0.0.3 (Beta)"
 APP_AUTHOR = "Arch"
 APP_AUTHOR_HANDLE = "@xarchfx"
 APP_AUTHOR_URL = "https://xarchfx.lol"
@@ -911,7 +911,7 @@ def parse_strict_tag_version(name):
     return tuple(int(part) for part in match.groups())
 
 
-WHATS_NEW_HEADING_RE = re.compile(r"^#{1,6}[^\n]*what'?s new[^\n]*$", re.IGNORECASE | re.MULTILINE)
+WHATS_NEW_HEADING_RE = re.compile(r"^#{1,6}[^\n]*what changed[^\n]*$", re.IGNORECASE | re.MULTILINE)
 
 
 def extract_whats_new(body):
@@ -929,7 +929,7 @@ def extract_whats_new(body):
             break
         if stripped.lower().startswith("**full changelog"):
             break
-        if stripped.startswith("- ") or stripped == "-":
+        if stripped.startswith("- ") or stripped.startswith("* ") or stripped in ("-", "*"):
             text = stripped[1:].strip()
             if text:
                 items.append(text)
@@ -2731,11 +2731,11 @@ function escapeHtml(text) {
 function formatInlineMarkdown(text) {
   let formatted = escapeHtml(String(text == null ? "" : text));
   formatted = formatted.replace(/`([^`]+)`/g, "<code>$1</code>");
-  formatted = formatted.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
-  formatted = formatted.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  formatted = formatted.replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^\\s)]+)\\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  formatted = formatted.replace(/\\*\\*([^*]+)\\*\\*/g, "<strong>$1</strong>");
   formatted = formatted.replace(/__([^_]+)__/g, "<strong>$1</strong>");
   formatted = formatted.replace(/~~([^~]+)~~/g, "<del>$1</del>");
-  formatted = formatted.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+  formatted = formatted.replace(/\\*([^*]+)\\*/g, "<em>$1</em>");
   formatted = formatted.replace(/_([^_]+)_/g, "<em>$1</em>");
   return formatted;
 }
