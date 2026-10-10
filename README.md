@@ -1,3 +1,5 @@
+<img width="1983" height="793" alt="SYS IO Banner" src="https://github.com/user-attachments/assets/ab79127a-f0d1-4d48-aef5-949d5dc8d687" />
+
 # SYS IO - Your PC Analyse Tool
 
 **SYS IO** is a comprehensive system information and hardware monitoring tool that provides detailed insights into PC components and the current system status.
