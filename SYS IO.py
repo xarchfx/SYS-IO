@@ -11,7 +11,6 @@ import json
 import platform
 import re
 import socket
-import urllib.error
 import urllib.request
 import uuid
 import subprocess
@@ -74,7 +73,7 @@ def get_cpu_usage_snapshot():
 
 
 APP_NAME = "SYS IO"
-APP_VERSION = "0.0.1 (Alpha)"
+APP_VERSION = "0.0.2 (Beta)"
 APP_AUTHOR = "Arch"
 APP_AUTHOR_HANDLE = "@xarchfx"
 APP_AUTHOR_URL = "https://xarchfx.lol"
@@ -151,7 +150,6 @@ def is_admin():
     if not IS_WINDOWS:
         return True
     try:
-        import ctypes
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
         return False
@@ -159,7 +157,6 @@ def is_admin():
 
 def show_admin_required_dialog():
     try:
-        import ctypes
         MB_OK = 0x0
         MB_ICONWARNING = 0x30
         ctypes.windll.user32.MessageBoxW(
@@ -196,7 +193,6 @@ def relaunch_as_admin():
     if not IS_WINDOWS:
         return False
     try:
-        import ctypes
         executable = sys.executable
         if IS_FROZEN:
             params = subprocess.list2cmdline(sys.argv[1:])
@@ -270,18 +266,45 @@ def is_virtual_display(name):
     return "virtual desktop monitor" in name.lower()
 
 
-def get_gpu_names():
+def wmi_connect(namespace=None):
+    if not (IS_WINDOWS and wmi):
+        return None
+    try:
+        return wmi.WMI(namespace=namespace) if namespace else wmi.WMI()
+    except Exception:
+        return None
+
+
+def wmi_first(conn, class_name):
+    if conn is None:
+        return None
+    try:
+        items = getattr(conn, class_name)()
+        return items[0] if items else None
+    except Exception:
+        return None
+
+
+def wmi_all(conn, class_name):
+    if conn is None:
+        return []
+    try:
+        return list(getattr(conn, class_name)())
+    except Exception:
+        return []
+
+
+def get_gpu_names(conn=None):
     names = []
-    if IS_WINDOWS and wmi:
+    conn = conn or wmi_connect()
+    for gpu in wmi_all(conn, "Win32_VideoController"):
         try:
-            c = wmi.WMI()
-            for gpu in c.Win32_VideoController():
-                name = safe(gpu.Name)
-                if is_virtual_display(name):
-                    continue
-                names.append(name)
+            name = safe(gpu.Name)
         except Exception:
-            pass
+            continue
+        if is_virtual_display(name):
+            continue
+        names.append(name)
     return names
 
 
@@ -326,30 +349,33 @@ def normalize_vram_bytes(adapter_ram):
     return value if value > 0 else None
 
 
-def get_cpu_name():
+def get_cpu_name(conn=None):
     name = safe(platform.processor())
-    if IS_WINDOWS and wmi:
+    cpu = wmi_first(conn or wmi_connect(), "Win32_Processor")
+    if cpu is not None:
         try:
-            c = wmi.WMI()
-            name = safe(c.Win32_Processor()[0].Name)
+            name = safe(cpu.Name)
         except Exception:
             pass
     return name
 
 
 def get_overview():
-    cpu_name = get_cpu_name()
-    gpu_names = get_gpu_names()
+    conn = wmi_connect()
+    cpu_name = get_cpu_name(conn)
+    gpu_names = get_gpu_names(conn)
+    board = wmi_first(conn, "Win32_BaseBoard")
     board_name = "N/A"
-    os_name = "N/A"
-    if IS_WINDOWS and wmi:
-        c = wmi.WMI()
+    if board is not None:
         try:
-            board_name = safe(c.Win32_BaseBoard()[0].Product)
+            board_name = safe(board.Product)
         except Exception:
             pass
+    os_info = wmi_first(conn, "Win32_OperatingSystem")
+    os_name = "N/A"
+    if os_info is not None:
         try:
-            os_name = safe(c.Win32_OperatingSystem()[0].Caption)
+            os_name = safe(os_info.Caption)
         except Exception:
             pass
     if os_name == "N/A":
@@ -372,7 +398,7 @@ def get_overview():
             "Architecture": safe(platform.machine()),
             "Uptime": live_uptime_value(boot_ts, include_seconds=True),
         },
-        "Hardware": dict(sorted(hardware.items())),
+        "Hardware": hardware,
         "Usage": {
             "CPU Usage": f"{total_cpu:.1f}%",
             "Memory Usage": f"{vm.percent}%",
@@ -398,10 +424,9 @@ def get_os_info():
         "Boot Time": boot_time,
         "Uptime": live_uptime_value(boot_ts, include_seconds=True),
     }
-    if IS_WINDOWS and wmi:
+    info = wmi_first(wmi_connect(), "Win32_OperatingSystem")
+    if info is not None:
         try:
-            c = wmi.WMI()
-            info = c.Win32_OperatingSystem()[0]
             general["OS Name"] = safe(info.Caption)
             general["Build"] = safe(info.BuildNumber)
             general["Install Date"] = safe(format_wmi_datetime(info.InstallDate))
@@ -424,82 +449,91 @@ def get_motherboard():
         "BIOS Version": "N/A",
         "BIOS Release Date": "N/A",
     }
-    if IS_WINDOWS and wmi:
-        c = wmi.WMI()
+    conn = wmi_connect()
+    board = wmi_first(conn, "Win32_BaseBoard")
+    if board is not None:
         try:
-            board = c.Win32_BaseBoard()[0]
             general["Manufacturer"] = safe(board.Manufacturer)
             general["Product"] = safe(board.Product)
             general["Version"] = safe(board.Version)
             general["Serial Number"] = safe(board.SerialNumber)
         except Exception:
             pass
+    bios_info = wmi_first(conn, "Win32_BIOS")
+    if bios_info is not None:
         try:
-            b = c.Win32_BIOS()[0]
-            bios["BIOS Vendor"] = safe(b.Manufacturer)
-            bios["BIOS Version"] = safe(b.SMBIOSBIOSVersion)
-            bios["BIOS Release Date"] = safe(format_wmi_datetime(b.ReleaseDate))
+            bios["BIOS Vendor"] = safe(bios_info.Manufacturer)
+            bios["BIOS Version"] = safe(bios_info.SMBIOSBIOSVersion)
+            bios["BIOS Release Date"] = safe(format_wmi_datetime(bios_info.ReleaseDate))
         except Exception:
             pass
     return {"General": general, "BIOS": bios}
 
 
 def get_processor():
+    conn = wmi_connect()
+    cpu = wmi_first(conn, "Win32_Processor")
+    manufacturer = "N/A"
+    socket_name = "N/A"
+    threads = "N/A"
+    l1_bytes = 0
+    l2_bytes = None
+    l3_bytes = None
+    if cpu is not None:
+        try:
+            manufacturer = safe(cpu.Manufacturer)
+            socket_name = safe(cpu.SocketDesignation)
+            threads = safe(cpu.ThreadCount)
+            try:
+                for cache in wmi_all(conn, "Win32_CacheMemory"):
+                    if int(cache.Level) == 3 and cache.MaxCacheSize:
+                        l1_bytes += int(cache.MaxCacheSize) * 1024
+            except Exception:
+                l1_bytes = 0
+            l2_bytes = cpu.L2CacheSize * 1024 if cpu.L2CacheSize else None
+            l3_bytes = cpu.L3CacheSize * 1024 if cpu.L3CacheSize else None
+        except Exception:
+            pass
     general = {
-        "Name": get_cpu_name(),
+        "Name": get_cpu_name(conn),
+        "Manufacturer": manufacturer,
         "Architecture": safe(platform.machine()),
+        "Socket": socket_name,
         "Physical Cores": safe(psutil.cpu_count(logical=False)),
         "Logical Cores": safe(psutil.cpu_count(logical=True)),
+        "Threads": threads,
+        "L1 Cache": bytes_to_readable(l1_bytes) if l1_bytes else "N/A",
+        "L2 Cache": bytes_to_readable(l2_bytes) if l2_bytes else "N/A",
+        "L3 Cache": bytes_to_readable(l3_bytes) if l3_bytes else "N/A",
     }
     total_cpu, per_core = get_cpu_usage_snapshot()
     usage = {"Total Usage": f"{total_cpu:.1f}%"}
     cores = {}
     for idx, core_usage in enumerate(per_core):
         cores[f"Core {idx + 1}"] = f"{core_usage:.1f}%"
-    if IS_WINDOWS and wmi:
-        try:
-            c = wmi.WMI()
-            cpu = c.Win32_Processor()[0]
-            general["Manufacturer"] = safe(cpu.Manufacturer)
-            general["Socket"] = safe(cpu.SocketDesignation)
-            general["Threads"] = safe(cpu.ThreadCount)
-            l1_bytes = 0
-            try:
-                for cache in c.Win32_CacheMemory():
-                    if int(cache.Level) == 3 and cache.MaxCacheSize:
-                        l1_bytes += int(cache.MaxCacheSize) * 1024
-            except Exception:
-                l1_bytes = 0
-            general["L1 Cache"] = bytes_to_readable(l1_bytes) if l1_bytes else "N/A"
-            general["L2 Cache"] = bytes_to_readable(cpu.L2CacheSize * 1024) if cpu.L2CacheSize else "N/A"
-            general["L3 Cache"] = bytes_to_readable(cpu.L3CacheSize * 1024) if cpu.L3CacheSize else "N/A"
-        except Exception:
-            pass
     return {"General": general, "Usage": usage, "Core Usage": cores}
 
 
 def get_graphics():
     groups = {}
-    if IS_WINDOWS and wmi:
-        try:
-            c = wmi.WMI()
-            gpus = [g for g in c.Win32_VideoController() if not is_virtual_display(safe(g.Name))]
-            registry_vram = get_gpu_vram_registry()
-            multiple = len(gpus) > 1
-            for idx, gpu in enumerate(gpus):
-                label = f"GPU {idx + 1}" if multiple else "GPU"
-                vram = normalize_vram_bytes(gpu.AdapterRAM)
-                if idx < len(registry_vram) and registry_vram[idx] > (vram or 0):
-                    vram = registry_vram[idx]
-                groups[label] = {
-                    "Name": safe(gpu.Name),
-                    "VRAM": bytes_to_readable(vram) if vram else "N/A",
-                    "Driver Version": safe(gpu.DriverVersion),
-                    "Resolution": f"{safe(gpu.CurrentHorizontalResolution)} x {safe(gpu.CurrentVerticalResolution)}",
-                    "Refresh Rate": f"{safe(gpu.CurrentRefreshRate)} Hz",
-                }
-        except Exception:
-            pass
+    try:
+        gpus = [g for g in wmi_all(wmi_connect(), "Win32_VideoController") if not is_virtual_display(safe(g.Name))]
+        registry_vram = get_gpu_vram_registry()
+        multiple = len(gpus) > 1
+        for idx, gpu in enumerate(gpus):
+            label = f"GPU {idx + 1}" if multiple else "GPU"
+            vram = normalize_vram_bytes(gpu.AdapterRAM)
+            if idx < len(registry_vram) and registry_vram[idx] > (vram or 0):
+                vram = registry_vram[idx]
+            groups[label] = {
+                "Name": safe(gpu.Name),
+                "VRAM": bytes_to_readable(vram) if vram else "N/A",
+                "Driver Version": safe(gpu.DriverVersion),
+                "Resolution": f"{safe(gpu.CurrentHorizontalResolution)} x {safe(gpu.CurrentVerticalResolution)}",
+                "Refresh Rate": f"{safe(gpu.CurrentRefreshRate)} Hz",
+            }
+    except Exception:
+        pass
     if not groups:
         groups["GPU"] = {"Name": "N/A"}
     return groups
@@ -517,32 +551,30 @@ def get_memory():
         "Swap Used": bytes_to_readable(sm.used),
     }
     groups = {"General": general}
-    if IS_WINDOWS and wmi:
-        try:
-            c = wmi.WMI()
-            modules = c.Win32_PhysicalMemory()
-            for idx, mod in enumerate(modules):
-                groups[f"Module {idx + 1}"] = {
-                    "Capacity": bytes_to_readable(int(mod.Capacity)) if mod.Capacity else "N/A",
-                    "Speed": f"{safe(mod.Speed)} MHz",
-                    "Manufacturer": safe(mod.Manufacturer),
-                    "Part Number": safe(mod.PartNumber),
-                }
-        except Exception:
-            pass
+    try:
+        memory_type_labels = {20: "DDR", 21: "DDR2", 24: "DDR3", 26: "DDR4", 34: "DDR5"}
+        for idx, mod in enumerate(wmi_all(wmi_connect(), "Win32_PhysicalMemory")):
+            groups[f"Module {idx + 1}"] = {
+                "Capacity": bytes_to_readable(int(mod.Capacity)) if mod.Capacity else "N/A",
+                "Speed": f"{safe(mod.Speed)} MHz",
+                "Type": memory_type_labels.get(getattr(mod, "SMBIOSMemoryType", None), "Unknown"),
+                "Manufacturer": safe(mod.Manufacturer),
+                "Part Number": safe(mod.PartNumber),
+            }
+    except Exception:
+        pass
     return groups
 
 
 def get_disk_media_types():
     media_types = {}
-    if IS_WINDOWS and wmi:
-        try:
-            storage = wmi.WMI(namespace="root\\Microsoft\\Windows\\Storage")
-            labels = {0: "Unknown", 3: "HDD", 4: "SSD", 5: "SCM"}
-            for disk in storage.MSFT_PhysicalDisk():
-                media_types[str(disk.DeviceId)] = labels.get(disk.MediaType, "Unknown")
-        except Exception:
-            pass
+    try:
+        storage = wmi_connect(namespace="root\\Microsoft\\Windows\\Storage")
+        labels = {0: "Unknown", 3: "HDD", 4: "SSD", 5: "SCM"}
+        for disk in wmi_all(storage, "MSFT_PhysicalDisk"):
+            media_types[str(disk.DeviceId)] = labels.get(disk.MediaType, "Unknown")
+    except Exception:
+        pass
     return media_types
 
 
@@ -576,35 +608,34 @@ def get_storage():
         drive_order.append(key)
 
     unmatched = []
-    if IS_WINDOWS and wmi:
-        try:
-            c = wmi.WMI()
-            media_types = get_disk_media_types()
-            unmatched_index = 1
-            for disk in c.Win32_DiskDrive():
-                size = disk.Size
-                disk_details = {
-                    "Disk Model": safe(disk.Model),
-                    "Disk Type": media_types.get(str(disk.Index), "Unknown"),
-                    "Interface": safe(disk.InterfaceType),
-                    "Disk Size": bytes_to_readable(int(size)) if size else "N/A",
-                    "Serial Number": safe(disk.SerialNumber),
-                }
-                matched = False
-                try:
-                    for partition in disk.associators("Win32_DiskDriveToDiskPartition"):
-                        for logical in partition.associators("Win32_LogicalDiskToPartition"):
-                            key = safe(logical.DeviceID).rstrip(":").upper()
-                            if key in drives:
-                                drives[key]["disk"] = disk_details
-                                matched = True
-                except Exception:
-                    pass
-                if not matched:
-                    unmatched.append((f"Disk {unmatched_index} ({safe(disk.Model)})", disk_details))
-                    unmatched_index += 1
-        except Exception:
-            pass
+    try:
+        media_types = get_disk_media_types()
+        unmatched_index = 1
+        for disk in wmi_all(wmi_connect(), "Win32_DiskDrive"):
+            size = disk.Size
+            disk_details = {
+                "Disk Model": safe(disk.Model),
+                "Disk Type": media_types.get(str(disk.Index), "Unknown"),
+                "Interface": safe(disk.InterfaceType),
+                "Disk Size": bytes_to_readable(int(size)) if size else "N/A",
+                "Health Status": safe(disk.Status),
+                "Serial Number": safe(disk.SerialNumber),
+            }
+            matched = False
+            try:
+                for partition in disk.associators("Win32_DiskDriveToDiskPartition"):
+                    for logical in partition.associators("Win32_LogicalDiskToPartition"):
+                        key = safe(logical.DeviceID).rstrip(":").upper()
+                        if key in drives:
+                            drives[key]["disk"] = disk_details
+                            matched = True
+            except Exception:
+                pass
+            if not matched:
+                unmatched.append((f"Disk {unmatched_index} ({safe(disk.Model)})", disk_details))
+                unmatched_index += 1
+    except Exception:
+        pass
 
     for key in drive_order:
         entry = drives[key]
@@ -617,22 +648,14 @@ def get_storage():
     return groups
 
 
-def get_temperatures():
-    cpu_group = {}
-    gpu_group = {}
-    other_group = {}
-    cpu_name = get_cpu_name()
-    if IS_WINDOWS and wmi:
-        try:
-            w = wmi.WMI(namespace="root\\wmi")
-            zones = w.MSAcpi_ThermalZoneTemperature()
-            for idx, zone in enumerate(zones):
-                kelvin = zone.CurrentTemperature / 10.0
-                celsius = kelvin - 273.15
-                label = f"{cpu_name} (Zone {idx + 1})" if len(zones) > 1 else cpu_name
-                cpu_group[label] = f"{celsius:.1f} °C"
-        except Exception:
-            pass
+_nvidia_smi_available = None
+
+
+def get_nvidia_gpu_temps():
+    global _nvidia_smi_available
+    gpu_temps = {}
+    if _nvidia_smi_available is False:
+        return gpu_temps
     try:
         run_kwargs = {"capture_output": True, "text": True, "timeout": 3}
         if IS_WINDOWS:
@@ -641,13 +664,33 @@ def get_temperatures():
             ["nvidia-smi", "--query-gpu=name,temperature.gpu", "--format=csv,noheader,nounits"],
             **run_kwargs,
         )
+        _nvidia_smi_available = True
         if result.returncode == 0 and result.stdout.strip():
             for line in result.stdout.strip().splitlines():
                 parts = [p.strip() for p in line.split(",")]
                 if len(parts) >= 2:
-                    gpu_group[parts[0]] = f"{parts[1]} °C"
+                    gpu_temps[parts[0]] = f"{parts[1]} °C"
+    except FileNotFoundError:
+        _nvidia_smi_available = False
     except Exception:
         pass
+    return gpu_temps
+
+
+def get_temperatures():
+    cpu_group = {}
+    other_group = {}
+    cpu_name = get_cpu_name()
+    zones = wmi_all(wmi_connect(namespace="root\\wmi"), "MSAcpi_ThermalZoneTemperature")
+    for idx, zone in enumerate(zones):
+        try:
+            kelvin = zone.CurrentTemperature / 10.0
+            celsius = kelvin - 273.15
+            label = f"{cpu_name} (Zone {idx + 1})" if len(zones) > 1 else cpu_name
+            cpu_group[label] = f"{celsius:.1f} °C"
+        except Exception:
+            continue
+    gpu_group = get_nvidia_gpu_temps()
     if not gpu_group:
         for name in get_gpu_names():
             gpu_group[name] = "N/A"
@@ -688,7 +731,6 @@ def get_volume_serial(drive="C:\\"):
     if not IS_WINDOWS:
         return "N/A"
     try:
-        import ctypes
         serial = ctypes.c_uint32(0)
         max_component = ctypes.c_uint32(0)
         flags = ctypes.c_uint32(0)
@@ -710,65 +752,94 @@ def get_volume_serial(drive="C:\\"):
         return "N/A"
 
 
-def get_network_macs():
-    macs = {}
+def get_network():
     try:
         addrs = psutil.net_if_addrs()
-        for iface, entries in addrs.items():
-            for entry in entries:
-                family = getattr(entry, "family", None)
-                is_link = family == psutil.AF_LINK or str(family).endswith("AF_LINK")
-                if is_link and entry.address and entry.address not in ("00:00:00:00:00:00", ""):
-                    macs[iface] = entry.address.upper()
-                    break
     except Exception:
-        pass
-    return macs
+        addrs = {}
+    try:
+        stats = psutil.net_if_stats()
+    except Exception:
+        stats = {}
+    try:
+        counters = psutil.net_io_counters(pernic=True)
+    except Exception:
+        counters = {}
+    entries = []
+    for iface, iface_addrs in addrs.items():
+        ipv4 = "N/A"
+        mac = "N/A"
+        for entry in iface_addrs:
+            family = getattr(entry, "family", None)
+            if family == socket.AF_INET:
+                ipv4 = entry.address
+            is_link = family == psutil.AF_LINK or str(family).endswith("AF_LINK")
+            if is_link and entry.address and entry.address not in ("00:00:00:00:00:00", ""):
+                mac = entry.address.upper()
+        stat = stats.get(iface)
+        counter = counters.get(iface)
+        is_up = stat is not None and stat.isup
+        details = {
+            "IPv4 Address": safe(ipv4),
+            "MAC Address": safe(mac),
+            "Status": "Up" if is_up else "Down",
+        }
+        if stat is not None:
+            details["Link Speed"] = f"{stat.speed} Mbps" if stat.speed else "N/A"
+        if counter is not None:
+            details["Sent"] = bytes_to_readable(counter.bytes_sent)
+            details["Received"] = bytes_to_readable(counter.bytes_recv)
+        entries.append((iface, details, is_up))
+    entries.sort(key=lambda item: not item[2])
+    groups = {iface: details for iface, details, _ in entries}
+    if not groups:
+        groups["Status"] = {"Adapters": "No network adapters detected"}
+    return groups
 
 
 def get_hardware_ids():
     mac = ":".join(["{:02x}".format((uuid.getnode() >> ele) & 0xff) for ele in range(40, -1, -8)]).upper()
     groups = {"General": {"MAC Address": mac, "Machine GUID": get_machine_guid()}}
-    if IS_WINDOWS and wmi:
-        c = wmi.WMI()
+    conn = wmi_connect()
+    cpu = wmi_first(conn, "Win32_Processor")
+    if cpu is not None:
         try:
-            cpu = c.Win32_Processor()[0]
             groups["Processor"] = {"Processor ID": safe(cpu.ProcessorId)}
         except Exception:
             pass
+    board = wmi_first(conn, "Win32_BaseBoard")
+    if board is not None:
         try:
-            board = c.Win32_BaseBoard()[0]
             groups["Motherboard"] = {"Motherboard Serial": safe(board.SerialNumber)}
         except Exception:
             pass
+    bios = wmi_first(conn, "Win32_BIOS")
+    if bios is not None:
         try:
-            bios = c.Win32_BIOS()[0]
             groups["BIOS"] = {"BIOS Serial": safe(bios.SerialNumber)}
         except Exception:
             pass
+    product = wmi_first(conn, "Win32_ComputerSystemProduct")
+    if product is not None:
         try:
-            product = c.Win32_ComputerSystemProduct()[0]
             groups["System"] = {"System UUID": safe(product.UUID)}
         except Exception:
             pass
+    os_info = wmi_first(conn, "Win32_OperatingSystem")
+    if os_info is not None:
         try:
-            os_info = c.Win32_OperatingSystem()[0]
             groups.setdefault("System", {})["Windows Product ID"] = safe(os_info.SerialNumber)
         except Exception:
             pass
-        try:
-            disks = c.Win32_DiskDrive()
-            disk_group = {}
-            for idx, disk in enumerate(disks):
-                disk_group[f"Disk {idx + 1}"] = safe(disk.SerialNumber)
-            if disk_group:
-                groups["Disks"] = disk_group
-        except Exception:
-            pass
+    try:
+        disk_group = {}
+        for idx, disk in enumerate(wmi_all(conn, "Win32_DiskDrive")):
+            disk_group[f"Disk {idx + 1}"] = safe(disk.SerialNumber)
+        if disk_group:
+            groups["Disks"] = disk_group
+    except Exception:
+        pass
     groups["System Drive"] = {"Volume Serial": get_volume_serial()}
-    net_macs = get_network_macs()
-    if net_macs:
-        groups["Network Adapters"] = net_macs
     return groups
 
 
@@ -880,6 +951,7 @@ PROVIDERS = {
     "graphics": get_graphics,
     "memory": get_memory,
     "storage": get_storage,
+    "network": get_network,
     "temperatures": get_temperatures,
     "hwid": get_hardware_ids,
     "misc": get_miscellaneous,
@@ -923,7 +995,7 @@ class UpdateCheckWorker(QThread):
         current = APP_VERSION
         try:
             release = fetch_latest_release()
-        except (urllib.error.URLError, urllib.error.HTTPError, Exception) as exc:
+        except Exception as exc:
             self.finishedCheck.emit(json.dumps({
                 "current": current,
                 "latest": None,
@@ -947,7 +1019,7 @@ class UpdateCheckWorker(QThread):
                 "asset_size": 0,
             }))
             return
-        latest = release.get("tag_name")
+        latest = (release.get("tag_name") or "").strip().lstrip("vV")
         current_tuple = parse_version_tuple(current)
         latest_tuple = parse_version_tuple(latest)
         if current_tuple is not None and latest_tuple is not None:
@@ -1892,9 +1964,9 @@ body.window-maximized #boot-screen {
 <script>
 const LOGO_URI = "__LOGO_URI__";
 const APP_VERSION = "__APP_VERSION__";
-const UPDATE_CHECK_URL = "https://github.com/xarchfx/sys-io/tags";
+const UPDATE_CHECK_URL = "__UPDATE_TAGS_URL__";
 const INITIAL_SETTINGS = __SETTINGS_JSON__;
-const CATEGORY_ORDER = ["overview", "os", "motherboard", "processor", "graphics", "memory", "storage", "temperatures", "hwid", "misc"];
+const CATEGORY_ORDER = __CATEGORY_ORDER_JSON__;
 const CATEGORY_META = {
   overview: { label: "Overview", icon: "fa-solid fa-gauge-high" },
   os: { label: "OS", icon: "fa-brands fa-windows" },
@@ -1903,12 +1975,13 @@ const CATEGORY_META = {
   graphics: { label: "Graphics Card", icon: "fa-solid fa-display" },
   memory: { label: "Memory", icon: "fa-solid fa-memory" },
   storage: { label: "Storage", icon: "fa-solid fa-hard-drive" },
+  network: { label: "Network", icon: "fa-solid fa-network-wired" },
   temperatures: { label: "Temperatures", icon: "fa-solid fa-temperature-half" },
   hwid: { label: "Hardware ID's", icon: "fa-solid fa-fingerprint" },
   misc: { label: "Miscellaneous", icon: "fa-solid fa-ellipsis" },
 };
 const SETTINGS_META = { label: "Settings", icon: "fa-solid fa-gear" };
-const RESTART_REQUIRED_KEYS = ["window_mode", "start_as_admin"];
+const RESTART_REQUIRED_KEYS = __RESTART_REQUIRED_KEYS_JSON__;
 const VALID_THEMES = ["dark", "light"];
 
 function resolveTheme(value) {
@@ -2234,23 +2307,36 @@ function setMiniLoaderVisible(visible) {
   loader.classList.toggle("show", visible && appReady);
 }
 
+function createGroupHeading(text) {
+  const heading = document.createElement("div");
+  heading.className = "group-heading";
+  heading.textContent = text;
+  return heading;
+}
+
+function createGroupSection(heading) {
+  const section = document.createElement("div");
+  section.className = "group-section";
+  if (heading) section.appendChild(createGroupHeading(heading));
+  const subgrid = document.createElement("div");
+  subgrid.className = "group-grid";
+  section.appendChild(subgrid);
+  return { section, subgrid };
+}
+
 function renderSkeleton() {
   renderedCategory = null;
   renderedValueEls = null;
   setMiniLoaderVisible(true);
   const grid = document.getElementById("data-grid");
   grid.innerHTML = "";
-  const section = document.createElement("div");
-  section.className = "group-section";
-  const subgrid = document.createElement("div");
-  subgrid.className = "group-grid";
+  const { section, subgrid } = createGroupSection();
   for (let i = 0; i < 6; i++) {
     const card = document.createElement("div");
     card.className = "card skeleton";
     card.style.height = "62px";
     subgrid.appendChild(card);
   }
-  section.appendChild(subgrid);
   grid.appendChild(section);
 }
 
@@ -2280,14 +2366,7 @@ function renderData(category, payload) {
     const fields = parsed[groupName] || {};
     const entries = Object.entries(fields);
     if (entries.length === 0) return;
-    const section = document.createElement("div");
-    section.className = "group-section";
-    const heading = document.createElement("div");
-    heading.className = "group-heading";
-    heading.textContent = groupName;
-    section.appendChild(heading);
-    const subgrid = document.createElement("div");
-    subgrid.className = "group-grid";
+    const { section, subgrid } = createGroupSection(groupName);
     entries.forEach(([key, value]) => {
       const card = document.createElement("div");
       card.className = "card";
@@ -2320,7 +2399,6 @@ function renderData(category, payload) {
       subgrid.appendChild(card);
       renderedValueEls[regKey] = val;
     });
-    section.appendChild(subgrid);
     grid.appendChild(section);
   });
 }
@@ -2372,15 +2450,11 @@ function renderError(message) {
   renderedValueEls = null;
   const grid = document.getElementById("data-grid");
   grid.innerHTML = "";
-  const section = document.createElement("div");
-  section.className = "group-section";
-  const subgrid = document.createElement("div");
-  subgrid.className = "group-grid";
+  const { section, subgrid } = createGroupSection();
   const card = document.createElement("div");
   card.className = "card error-card";
   card.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i><span>${message}</span>`;
   subgrid.appendChild(card);
-  section.appendChild(subgrid);
   grid.appendChild(section);
 }
 
@@ -2485,10 +2559,7 @@ function renderSettings() {
 
   const appearanceSection = document.createElement("div");
   appearanceSection.className = "group-section";
-  const appearanceHeading = document.createElement("div");
-  appearanceHeading.className = "group-heading";
-  appearanceHeading.textContent = "Appearance";
-  appearanceSection.appendChild(appearanceHeading);
+  appearanceSection.appendChild(createGroupHeading("Appearance"));
   const themeRow = buildSettingRow("Theme", "Switch the App-Theme.");
   themeRow.appendChild(buildSegmented(
     [{ label: "Dark", value: "dark" }, { label: "Light", value: "light" }],
@@ -2500,10 +2571,7 @@ function renderSettings() {
 
   const perfSection = document.createElement("div");
   perfSection.className = "group-section";
-  const perfHeading = document.createElement("div");
-  perfHeading.className = "group-heading";
-  perfHeading.textContent = "Performance";
-  perfSection.appendChild(perfHeading);
+  perfSection.appendChild(createGroupHeading("Performance"));
   const refreshRow = buildSettingRow("Refresh Rate", "How often the current category reloads itself automatically.");
   refreshRow.appendChild(buildSegmented(
     [
@@ -2535,11 +2603,8 @@ function renderSettings() {
 
   const windowSection = document.createElement("div");
   windowSection.className = "group-section";
-  const windowHeading = document.createElement("div");
-  windowHeading.className = "group-heading";
-  windowHeading.textContent = "Window";
-  windowSection.appendChild(windowHeading);
-  const windowRow = buildSettingRow("Window Style", "Use a cusrom window or the default Windows window frame.");
+  windowSection.appendChild(createGroupHeading("Window"));
+  const windowRow = buildSettingRow("Window Style", "Use a custom window or the default Windows window frame.");
   windowRow.appendChild(buildSegmented(
     [{ label: "Default Window", value: "default" }, { label: "Custom Window", value: "custom" }],
     currentSettings.window_mode,
@@ -2550,10 +2615,7 @@ function renderSettings() {
 
   const privSection = document.createElement("div");
   privSection.className = "group-section";
-  const privHeading = document.createElement("div");
-  privHeading.className = "group-heading";
-  privHeading.textContent = "Privileges";
-  privSection.appendChild(privHeading);
+  privSection.appendChild(createGroupHeading("Privileges"));
   const adminRow = buildSettingRow("Start as Administrator", "Recommended for full hardware access. Applies on next launch.");
   adminRow.appendChild(buildSwitchControl(
     !!currentSettings.start_as_admin,
@@ -2781,6 +2843,9 @@ def build_html():
     html = html.replace("__APP_VERSION__", APP_VERSION)
     html = html.replace("__APP_AUTHOR__", APP_AUTHOR)
     html = html.replace("__APP_AUTHOR_HANDLE__", APP_AUTHOR_HANDLE)
+    html = html.replace("__UPDATE_TAGS_URL__", UPDATE_TAGS_PAGE_URL)
+    html = html.replace("__CATEGORY_ORDER_JSON__", json.dumps(list(PROVIDERS.keys())))
+    html = html.replace("__RESTART_REQUIRED_KEYS_JSON__", json.dumps(sorted(RESTART_REQUIRED_KEYS)))
     return html
 
 
