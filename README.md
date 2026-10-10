@@ -1,3 +1,5 @@
+# SYS IO - Your PC Analyse Tool
+
 **SYS IO** is a comprehensive system information and hardware monitoring tool that provides detailed insights into PC components and the current system status.
 
 Developed by Arch (@xarchfx), this project combines a powerful Python backend with a modern, responsive web interface (HTML/CSS/JS) rendered via PyQt6.
