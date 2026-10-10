@@ -15,7 +15,6 @@ Developed by Arch (@xarchfx), this project combines a powerful Python backend wi
 
 This project utilizes a hybrid approach:
 * **Backend:** Python 3.15
-* **System Access:** `psutil`, `wmi`
 * **Frontend Rendering:** PyQt6 (`QWebEngineView`, `QWebChannel`)
 * **User Interface:** HTML, CSS, JavaScript, FontAwesome
 
@@ -23,7 +22,7 @@ This project utilizes a hybrid approach:
 
 Simply start the application. ( `.exe` )
 
-Upon the first launch on Windows, the app prompts for administrator privileges (UAC) by default, as these are required to read certain hardware IDs and BIOS information. This behavior can be disabled in the in-app settings.
+Upon the launch on Windows, the app prompts for administrator privileges (UAC) by default, as these are required to read certain hardware IDs and BIOS information. This behavior can be disabled in the in-app settings.
 
 ## 👨‍💻 Author
 
