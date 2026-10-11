@@ -74,7 +74,7 @@ def get_cpu_usage_snapshot():
 
 
 APP_NAME = "SYS IO"
-APP_VERSION = "0.0.3 (Beta)"
+APP_VERSION = "0.0.5 (Beta)"
 APP_AUTHOR = "Arch"
 APP_AUTHOR_HANDLE = "@xarchfx"
 APP_AUTHOR_URL = "https://xarchfx.lol"
@@ -268,7 +268,7 @@ def bytes_to_readable(num):
 def safe(value, fallback="N/A"):
     if value is None:
         return fallback
-    text = str(value).strip()
+    text = re.sub(r"\s+", " ", str(value)).strip()
     return text if text else fallback
 
 
@@ -327,27 +327,66 @@ def wmi_all(conn, class_name):
         return []
 
 
+PLACEHOLDER_WMI_VALUES = {
+    "default string",
+    "to be filled by o.e.m.",
+    "to be filled by oem",
+    "fill by oem",
+    "fill by o.e.m.",
+    "system serial number",
+    "system version",
+    "system manufacturer",
+    "system product name",
+    "system name",
+    "system sku number",
+    "system family",
+    "base board manufacturer",
+    "base board product name",
+    "base board version",
+    "base board serial number",
+    "base board asset tag",
+    "base board asset tag#",
+    "chassis manufacturer",
+    "chassis manufacture",
+    "chassis version",
+    "chassis serial number",
+    "chassis asset tag",
+    "default version",
+    "default manufacturer",
+    "not specified",
+    "not applicable",
+    "not available",
+    "none",
+    "empty",
+    "unknown",
+    "undefined",
+    "invalid",
+    "o.e.m.",
+    "oem",
+    "n/a",
+    "na",
+    "0123456789",
+    "1234567890",
+    "00000000-0000-0000-0000-000000000000",
+    "ffffffff-ffff-ffff-ffff-ffffffffffff",
+    "03000200-0400-0500-0006-000700080009",
+}
+
+
+def is_placeholder_value(text):
+    return str(text).strip().lower() in PLACEHOLDER_WMI_VALUES
+
+
 def wmi_attr(obj, attr, fallback="N/A"):
     if obj is None:
         return fallback
     try:
-        return safe(getattr(obj, attr, None), fallback)
+        value = safe(getattr(obj, attr, None), fallback)
     except Exception:
         return fallback
-
-
-def get_gpu_names(conn=None):
-    names = []
-    conn = conn or wmi_connect()
-    for gpu in wmi_all(conn, "Win32_VideoController"):
-        try:
-            name = safe(gpu.Name)
-        except Exception:
-            continue
-        if is_virtual_display(name):
-            continue
-        names.append(name)
-    return names
+    if value != fallback and is_placeholder_value(value):
+        return fallback
+    return value
 
 
 def get_gpu_vram_registry():
@@ -391,29 +430,105 @@ def normalize_vram_bytes(adapter_ram):
     return value if value > 0 else None
 
 
+def collect_gpu_details():
+    details = []
+    try:
+        gpus = [g for g in wmi_all(wmi_connect(), "Win32_VideoController") if not is_virtual_display(safe(g.Name))]
+        registry_vram = get_gpu_vram_registry()
+        for idx, gpu in enumerate(gpus):
+            try:
+                name = wmi_attr(gpu, "Name")
+                driver = wmi_attr(gpu, "DriverVersion")
+                horizontal = wmi_attr(gpu, "CurrentHorizontalResolution")
+                vertical = wmi_attr(gpu, "CurrentVerticalResolution")
+                refresh = wmi_attr(gpu, "CurrentRefreshRate")
+                vram = normalize_vram_bytes(gpu.AdapterRAM)
+                if idx < len(registry_vram) and registry_vram[idx] > (vram or 0):
+                    vram = registry_vram[idx]
+                vram_text = bytes_to_readable(vram) if vram else "N/A"
+                fields = (name, vram_text, driver, horizontal, vertical, refresh)
+                if any(field == "N/A" for field in fields):
+                    continue
+                details.append({
+                    "Name": name,
+                    "VRAM": vram_text,
+                    "Driver Version": driver,
+                    "Resolution": f"{horizontal} x {vertical}",
+                    "Refresh Rate": f"{refresh} Hz",
+                })
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return details
+
+
 def get_cpu_name(conn=None):
     cpu = wmi_first(conn or wmi_connect(), "Win32_Processor")
     return wmi_attr(cpu, "Name", safe(platform.processor()))
 
 
+def get_motherboard_name(conn=None):
+    board = wmi_first(conn or wmi_connect(), "Win32_BaseBoard")
+    manufacturer = wmi_attr(board, "Manufacturer")
+    product = wmi_attr(board, "Product")
+    if manufacturer != "N/A" and product != "N/A":
+        if manufacturer.lower() in product.lower():
+            return product
+        return f"{manufacturer} {product}"
+    if product != "N/A":
+        return product
+    return manufacturer
+
+
+def format_counted_names(names):
+    if not names:
+        return "N/A"
+    counts = {}
+    order = []
+    for name in names:
+        if name not in counts:
+            counts[name] = 0
+            order.append(name)
+        counts[name] += 1
+    parts = [f"{counts[name]}x {name}" if counts[name] > 1 else name for name in order]
+    return ", ".join(parts)
+
+
+def collect_ram_names(conn=None):
+    names = []
+    for mod in wmi_all(conn or wmi_connect(), "Win32_PhysicalMemory"):
+        try:
+            manufacturer = wmi_attr(mod, "Manufacturer")
+            part_number = wmi_attr(mod, "PartNumber")
+            parts = []
+            if manufacturer != "N/A":
+                parts.append(manufacturer)
+            if part_number != "N/A" and part_number not in parts:
+                parts.append(part_number)
+            if parts:
+                names.append(" ".join(parts))
+        except Exception:
+            continue
+    return names
+
+
 def get_overview():
     conn = wmi_connect()
     cpu_name = get_cpu_name(conn)
-    gpu_names = get_gpu_names(conn)
-    board = wmi_first(conn, "Win32_BaseBoard")
-    board_name = wmi_attr(board, "Product")
+    gpu_names = [gpu["Name"] for gpu in collect_gpu_details()]
+    motherboard_name = get_motherboard_name(conn)
+    ram_name = format_counted_names(collect_ram_names(conn))
     os_info = wmi_first(conn, "Win32_OperatingSystem")
     os_name = wmi_attr(os_info, "Caption", safe(f"{platform.system()} {platform.release()}"))
     boot_ts = psutil.boot_time()
     vm = psutil.virtual_memory()
     total_cpu, _ = get_cpu_usage_snapshot()
     hardware = {
+        "Motherboard": motherboard_name,
         "Processor": cpu_name,
-        "Physical Cores": safe(psutil.cpu_count(logical=False)),
-        "Logical Cores": safe(psutil.cpu_count(logical=True)),
         "Graphics Card": ", ".join(gpu_names) if gpu_names else "N/A",
-        "Motherboard": board_name,
-        "Total Memory": bytes_to_readable(vm.total),
+        "Memory": ram_name,
     }
     return {
         "System": {
@@ -424,9 +539,10 @@ def get_overview():
         },
         "Hardware": hardware,
         "Usage": {
-            "CPU Usage": f"{total_cpu:.1f}%",
+            "Processor Usage": f"{total_cpu:.1f}%",
+            "Graphics Card Usage": get_overview_gpu_usage(),
             "Memory Usage": f"{vm.percent}%",
-            "Processes Running": safe(len(psutil.pids())),
+            "Processes": safe(len(psutil.pids())),
         },
     }
 
@@ -496,21 +612,37 @@ def get_processor():
     manufacturer = wmi_attr(cpu, "Manufacturer")
     socket_name = wmi_attr(cpu, "SocketDesignation")
     threads = wmi_attr(cpu, "ThreadCount")
+    if threads == "N/A":
+        threads = safe(psutil.cpu_count(logical=True))
     l1_bytes = 0
-    l2_bytes = None
-    l3_bytes = None
+    l2_bytes = 0
+    l3_bytes = 0
     if cpu is not None:
         try:
             for cache in wmi_all(conn, "Win32_CacheMemory"):
-                if int(cache.Level) == 3 and cache.MaxCacheSize:
-                    l1_bytes += int(cache.MaxCacheSize) * 1024
-        except Exception:
-            l1_bytes = 0
-        try:
-            l2_bytes = cpu.L2CacheSize * 1024 if cpu.L2CacheSize else None
-            l3_bytes = cpu.L3CacheSize * 1024 if cpu.L3CacheSize else None
+                level = int(getattr(cache, "Level", 0) or 0)
+                size = getattr(cache, "MaxCacheSize", None) or getattr(cache, "InstalledSize", None)
+                if not size:
+                    continue
+                size_bytes = int(size) * 1024
+                if level == 3:
+                    l1_bytes += size_bytes
+                elif level == 4:
+                    l2_bytes += size_bytes
+                elif level == 5:
+                    l3_bytes += size_bytes
         except Exception:
             pass
+        if not l2_bytes:
+            try:
+                l2_bytes = cpu.L2CacheSize * 1024 if cpu.L2CacheSize else 0
+            except Exception:
+                pass
+        if not l3_bytes:
+            try:
+                l3_bytes = cpu.L3CacheSize * 1024 if cpu.L3CacheSize else 0
+            except Exception:
+                pass
     general = {
         "Name": get_cpu_name(conn),
         "Manufacturer": manufacturer,
@@ -533,27 +665,11 @@ def get_processor():
 
 def get_graphics():
     groups = {}
-    try:
-        gpus = [g for g in wmi_all(wmi_connect(), "Win32_VideoController") if not is_virtual_display(safe(g.Name))]
-        registry_vram = get_gpu_vram_registry()
-        multiple = len(gpus) > 1
-        for idx, gpu in enumerate(gpus):
-            label = f"GPU {idx + 1}" if multiple else "GPU"
-            try:
-                vram = normalize_vram_bytes(gpu.AdapterRAM)
-                if idx < len(registry_vram) and registry_vram[idx] > (vram or 0):
-                    vram = registry_vram[idx]
-                groups[label] = {
-                    "Name": safe(gpu.Name),
-                    "VRAM": bytes_to_readable(vram) if vram else "N/A",
-                    "Driver Version": safe(gpu.DriverVersion),
-                    "Resolution": f"{safe(gpu.CurrentHorizontalResolution)} x {safe(gpu.CurrentVerticalResolution)}",
-                    "Refresh Rate": f"{safe(gpu.CurrentRefreshRate)} Hz",
-                }
-            except Exception:
-                continue
-    except Exception:
-        pass
+    collected = collect_gpu_details()
+    multiple = len(collected) > 1
+    for idx, entry in enumerate(collected):
+        label = f"GPU {idx + 1}" if multiple else "GPU"
+        groups[label] = entry
     if not groups:
         groups["GPU"] = {"Name": "N/A"}
     return groups
@@ -572,14 +688,24 @@ def get_memory():
     }
     groups = {"General": general}
     memory_type_labels = {20: "DDR", 21: "DDR2", 24: "DDR3", 26: "DDR4", 34: "DDR5"}
+
+    def resolve_memory_type(mod):
+        label = memory_type_labels.get(getattr(mod, "SMBIOSMemoryType", None))
+        if label:
+            return label
+        label = memory_type_labels.get(getattr(mod, "MemoryType", None))
+        return label or "Unknown"
+
     for idx, mod in enumerate(wmi_all(wmi_connect(), "Win32_PhysicalMemory")):
         try:
+            configured_speed = getattr(mod, "ConfiguredClockSpeed", None)
+            speed = configured_speed if configured_speed else getattr(mod, "Speed", None)
             groups[f"Module {idx + 1}"] = {
                 "Capacity": bytes_to_readable(int(mod.Capacity)) if mod.Capacity else "N/A",
-                "Speed": f"{safe(mod.Speed)} MHz",
-                "Type": memory_type_labels.get(getattr(mod, "SMBIOSMemoryType", None), "Unknown"),
-                "Manufacturer": safe(mod.Manufacturer),
-                "Part Number": safe(mod.PartNumber),
+                "Speed": f"{safe(speed)} MHz",
+                "Type": resolve_memory_type(mod),
+                "Manufacturer": wmi_attr(mod, "Manufacturer"),
+                "Part Number": wmi_attr(mod, "PartNumber"),
             }
         except Exception:
             continue
@@ -588,14 +714,24 @@ def get_memory():
 
 def get_disk_media_types():
     media_types = {}
+    bus_types = {}
     try:
         storage = wmi_connect(namespace="root\\Microsoft\\Windows\\Storage")
-        labels = {0: "Unknown", 3: "HDD", 4: "SSD", 5: "SCM"}
+        media_labels = {0: "Unknown", 3: "HDD", 4: "SSD", 5: "SCM"}
+        bus_labels = {
+            1: "SCSI", 2: "ATAPI", 3: "ATA", 4: "1394", 5: "SSA", 6: "Fibre Channel",
+            7: "USB", 8: "RAID", 9: "iSCSI", 10: "SAS", 11: "SATA", 12: "SD",
+            13: "MMC", 15: "File Backed Virtual", 16: "Storage Spaces", 17: "NVMe",
+        }
         for disk in wmi_all(storage, "MSFT_PhysicalDisk"):
-            media_types[str(disk.DeviceId)] = labels.get(disk.MediaType, "Unknown")
+            device_id = str(disk.DeviceId)
+            media_types[device_id] = media_labels.get(disk.MediaType, "Unknown")
+            bus_label = bus_labels.get(getattr(disk, "BusType", None))
+            if bus_label:
+                bus_types[device_id] = bus_label
     except Exception:
         pass
-    return media_types
+    return media_types, bus_types
 
 
 def get_storage():
@@ -629,15 +765,16 @@ def get_storage():
         drive_order.append(key)
 
     unmatched = []
-    media_types = get_disk_media_types()
+    media_types, bus_types = get_disk_media_types()
     unmatched_index = 1
     for disk in wmi_all(wmi_connect(), "Win32_DiskDrive"):
         try:
             size = disk.Size
+            disk_index = str(disk.Index)
             disk_details = {
                 "Disk Model": safe(disk.Model),
-                "Disk Type": media_types.get(str(disk.Index), "Unknown"),
-                "Interface": safe(disk.InterfaceType),
+                "Disk Type": media_types.get(disk_index, "Unknown"),
+                "Interface": bus_types.get(disk_index) or safe(disk.InterfaceType),
                 "Disk Size": bytes_to_readable(int(size)) if size else "N/A",
                 "Health Status": safe(disk.Status),
                 "Serial Number": safe(disk.SerialNumber),
@@ -712,6 +849,59 @@ def get_nvidia_gpu_temps():
         return dict(temps)
 
 
+_nvidia_smi_usage_cache = {"timestamp": 0.0, "usage": {}}
+
+
+def _query_nvidia_gpu_usage():
+    gpu_usage = {}
+    global _nvidia_smi_available
+    try:
+        run_kwargs = {"capture_output": True, "text": True, "timeout": 3}
+        if IS_WINDOWS:
+            run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,utilization.gpu", "--format=csv,noheader,nounits"],
+            **run_kwargs,
+        )
+        _nvidia_smi_available = True
+        if result.returncode == 0 and result.stdout.strip():
+            for line in result.stdout.strip().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) >= 2:
+                    gpu_usage[parts[0]] = parts[1]
+    except FileNotFoundError:
+        _nvidia_smi_available = False
+    except Exception:
+        pass
+    return gpu_usage
+
+
+def get_nvidia_gpu_usage():
+    if _nvidia_smi_available is False:
+        return {}
+    now = time.monotonic()
+    with _nvidia_smi_lock:
+        if now - _nvidia_smi_usage_cache["timestamp"] < NVIDIA_SMI_CACHE_SECONDS:
+            return dict(_nvidia_smi_usage_cache["usage"])
+        usage = _query_nvidia_gpu_usage()
+        _nvidia_smi_usage_cache["timestamp"] = now
+        _nvidia_smi_usage_cache["usage"] = usage
+        return dict(usage)
+
+
+def get_overview_gpu_usage():
+    usage = get_nvidia_gpu_usage()
+    values = []
+    for raw in usage.values():
+        try:
+            values.append(float(raw))
+        except (TypeError, ValueError):
+            continue
+    if not values:
+        return "N/A"
+    return f"{sum(values) / len(values):.1f}%"
+
+
 def get_temperatures():
     cpu_group = {}
     other_group = {}
@@ -727,8 +917,8 @@ def get_temperatures():
             continue
     gpu_group = get_nvidia_gpu_temps()
     if not gpu_group:
-        for name in get_gpu_names():
-            gpu_group[name] = "N/A"
+        for gpu in collect_gpu_details():
+            gpu_group[gpu["Name"]] = "N/A"
     if hasattr(psutil, "sensors_temperatures"):
         try:
             temps = psutil.sensors_temperatures()
@@ -1353,6 +1543,79 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   --skeleton-b: #e0e0e6;
   --shadow: rgba(0, 0, 0, 0.12);
 }
+:root[data-theme="halloween"] {
+  --bg: #120b18;
+  --bg-elevated: #180f20;
+  --bg-card: #1f1428;
+  --border: #30203c;
+  --border-strong: #46304f;
+  --fg: #ede2d6;
+  --fg-dim: #9686a3;
+  --accent: #ff9a3c;
+  --accent-contrast: #1a0f12;
+  --accent-soft: rgba(255, 154, 60, 0.16);
+  --scrollbar: #46304f;
+  --skeleton-a: #1f1428;
+  --skeleton-b: #2b1c38;
+  --shadow: rgba(0, 0, 0, 0.45);
+}
+:root[data-theme="halloween"] .boot-logo-wrap,
+:root[data-theme="halloween"] #sidebar-footer,
+:root[data-theme="halloween"] #titlebar {
+  position: relative;
+}
+:root[data-theme="halloween"] .boot-logo-wrap::before {
+  content: "🕸️";
+  position: absolute;
+  top: -14px;
+  left: -26px;
+  font-size: 20px;
+  opacity: 0.8;
+}
+:root[data-theme="halloween"] .boot-logo-wrap::after {
+  content: "🦇";
+  position: absolute;
+  bottom: -10px;
+  right: -28px;
+  font-size: 20px;
+  opacity: 0.85;
+}
+:root[data-theme="halloween"] #titlebar::after {
+  content: "🎃";
+  position: absolute;
+  right: 150px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 16px;
+  opacity: 0.8;
+  pointer-events: none;
+}
+:root[data-theme="halloween"] #sidebar-footer::after {
+  content: "🎃";
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  font-size: 18px;
+  opacity: 0.85;
+}
+:root[data-theme="halloween"] #content-header {
+  position: relative;
+  overflow: hidden;
+}
+:root[data-theme="halloween"] #content-header::before {
+  content: "🌙";
+  position: absolute;
+  right: 54px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 26px;
+  opacity: 0.18;
+  pointer-events: none;
+}
+:root[data-theme="halloween"] .card:hover {
+  border-color: var(--accent);
+  box-shadow: 0 10px 22px var(--shadow), 0 0 0 1px rgba(255, 154, 60, 0.18);
+}
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { height: 100%; }
 button, input { font-family: inherit; }
@@ -1686,6 +1949,17 @@ body.window-maximized #boot-screen {
 }
 .card-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--fg-dim); margin-bottom: 8px; }
 .card-value { font-size: 15px; font-weight: 600; color: var(--fg); word-break: break-word; }
+.card-deco {
+  position: absolute;
+  pointer-events: none;
+  user-select: none;
+  line-height: 1;
+  filter: saturate(0.9);
+}
+.card-deco-tl { top: 6px; left: 8px; }
+.card-deco-tr { top: 6px; right: 42px; }
+.card-deco-bl { bottom: 6px; left: 10px; }
+.card-deco-br { bottom: 6px; right: 14px; }
 .card.skeleton {
   background: linear-gradient(90deg, var(--skeleton-a) 25%, var(--skeleton-b) 37%, var(--skeleton-a) 63%);
   background-size: 400% 100%;
@@ -2019,7 +2293,7 @@ const CATEGORY_META = {
 };
 const SETTINGS_META = { label: "Settings", icon: "fa-solid fa-gear" };
 const RESTART_REQUIRED_KEYS = __RESTART_REQUIRED_KEYS_JSON__;
-const VALID_THEMES = ["dark", "light"];
+const VALID_THEMES = ["dark", "light", "halloween"];
 
 function resolveTheme(value) {
   return VALID_THEMES.includes(value) ? value : "dark";
@@ -2361,6 +2635,29 @@ function createGroupSection(heading) {
   return { section, subgrid };
 }
 
+const HALLOWEEN_DECOS = ["🎃", "👻", "🦇", "🕸️", "🕷️", "💀", "🧙", "🔮"];
+const HALLOWEEN_POSITIONS = ["tl", "tr", "bl", "br"];
+const HALLOWEEN_DECO_CHANCE = 0.35;
+
+function addHalloweenDecoration(card) {
+  if (document.documentElement.getAttribute("data-theme") !== "halloween") return;
+  if (Math.random() > HALLOWEEN_DECO_CHANCE) return;
+  const deco = document.createElement("span");
+  deco.className = "card-deco";
+  deco.setAttribute("aria-hidden", "true");
+  const emoji = HALLOWEEN_DECOS[Math.floor(Math.random() * HALLOWEEN_DECOS.length)];
+  const position = HALLOWEEN_POSITIONS[Math.floor(Math.random() * HALLOWEEN_POSITIONS.length)];
+  const rotation = Math.round(Math.random() * 30 - 15);
+  const size = 14 + Math.round(Math.random() * 8);
+  const opacity = (0.14 + Math.random() * 0.14).toFixed(2);
+  deco.textContent = emoji;
+  deco.classList.add(`card-deco-${position}`);
+  deco.style.transform = `rotate(${rotation}deg)`;
+  deco.style.fontSize = `${size}px`;
+  deco.style.opacity = opacity;
+  card.appendChild(deco);
+}
+
 function renderSkeleton() {
   renderedCategory = null;
   renderedValueEls = null;
@@ -2409,6 +2706,7 @@ function renderData(category, payload) {
       card.className = "card";
       card.style.animationDelay = `${cardIndex * 30}ms`;
       cardIndex += 1;
+      addHalloweenDecoration(card);
       const label = document.createElement("div");
       label.className = "card-label";
       label.textContent = key;
@@ -2523,6 +2821,9 @@ function persistSettings(partial) {
 function applySettingEffects(key) {
   if (key === "theme") {
     document.documentElement.setAttribute("data-theme", resolveTheme(currentSettings.theme));
+    if (renderedCategory && Object.prototype.hasOwnProperty.call(loadedCache, renderedCategory)) {
+      renderData(renderedCategory, loadedCache[renderedCategory]);
+    }
   }
   if (key === "refresh_mode" || key === "refresh_custom_seconds") {
     restartAutoRefresh();
@@ -2599,7 +2900,11 @@ function renderSettings() {
   appearanceSection.appendChild(createGroupHeading("Appearance"));
   const themeRow = buildSettingRow("Theme", "Switch the App-Theme.");
   themeRow.appendChild(buildSegmented(
-    [{ label: "Dark", value: "dark" }, { label: "Light", value: "light" }],
+    [
+      { label: "Dark", value: "dark" },
+      { label: "Light", value: "light" },
+      { label: "Halloween", value: "halloween" },
+    ],
     currentSettings.theme,
     (value) => { updateSetting("theme", value); renderSettings(); }
   ));
