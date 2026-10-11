@@ -14,6 +14,7 @@ import socket
 import urllib.request
 import uuid
 import subprocess
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -24,6 +25,7 @@ from PyQt6.QtCore import (
     QUrl,
     QObject,
     QThread,
+    QMetaObject,
     QCoreApplication,
     QEvent,
     pyqtSlot,
@@ -33,7 +35,7 @@ from PyQt6.QtCore import (
     QTimer,
 )
 from PyQt6.QtGui import QDesktopServices, QIcon, QColor
-from PyQt6.QtWidgets import QApplication, QMainWindow, QMessageBox
+from PyQt6.QtWidgets import QApplication, QMainWindow, QMessageBox, QFileDialog
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineSettings
 from PyQt6.QtWebChannel import QWebChannel
@@ -55,7 +57,11 @@ _cpu_state = {"total": 0.0, "percpu": []}
 
 def _cpu_monitor_loop():
     while True:
-        percpu = psutil.cpu_percent(interval=1, percpu=True)
+        try:
+            percpu = psutil.cpu_percent(interval=1, percpu=True)
+        except Exception:
+            time.sleep(1)
+            continue
         total = sum(percpu) / len(percpu) if percpu else 0.0
         with _cpu_state_lock:
             _cpu_state["total"] = total
@@ -126,6 +132,31 @@ DEFAULT_SETTINGS = {
 }
 
 RESTART_REQUIRED_KEYS = {"window_mode", "start_as_admin"}
+VALID_THEMES = {"dark", "light", "halloween"}
+VALID_REFRESH_MODES = {"fast", "normal", "slow", "custom"}
+VALID_WINDOW_MODES = {"default", "custom"}
+
+
+def validate_imported_settings(data):
+    if not isinstance(data, dict):
+        return {}
+    result = {}
+    if data.get("theme") in VALID_THEMES:
+        result["theme"] = data["theme"]
+    if data.get("refresh_mode") in VALID_REFRESH_MODES:
+        result["refresh_mode"] = data["refresh_mode"]
+    if "refresh_custom_seconds" in data:
+        try:
+            seconds = int(data["refresh_custom_seconds"])
+            if seconds >= 0:
+                result["refresh_custom_seconds"] = seconds
+        except (TypeError, ValueError):
+            pass
+    if data.get("window_mode") in VALID_WINDOW_MODES:
+        result["window_mode"] = data["window_mode"]
+    if isinstance(data.get("start_as_admin"), bool):
+        result["start_as_admin"] = data["start_as_admin"]
+    return result
 
 
 def load_settings():
@@ -252,6 +283,58 @@ def relaunch_as_admin():
         return False
 
 
+def write_restart_script(executable, args, pid):
+    script_path = os.path.join(tempfile.gettempdir(), "restart.bat")
+    command = subprocess.list2cmdline([executable] + args)
+    content = (
+        "@echo off\r\n"
+        "setlocal\r\n"
+        f"set PID={pid}\r\n"
+        "set COUNT=0\r\n"
+        ":wait\r\n"
+        'tasklist /fi "PID eq %PID%" 2>nul | find "%PID%" >nul\r\n'
+        "if errorlevel 1 goto launch\r\n"
+        "set /a COUNT+=1\r\n"
+        "if %COUNT% geq 50 goto launch\r\n"
+        "ping -n 1 -w 100 127.0.0.1 >nul\r\n"
+        "goto wait\r\n"
+        ":launch\r\n"
+        f'start "" {command}\r\n'
+        'del "%~f0"\r\n'
+    )
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return script_path
+
+
+def relaunch_self():
+    try:
+        executable = sys.executable
+        if IS_FROZEN:
+            args = sys.argv[1:]
+        else:
+            if IS_WINDOWS:
+                pythonw = os.path.join(os.path.dirname(executable), "pythonw.exe")
+                if os.path.exists(pythonw):
+                    executable = pythonw
+            args = [os.path.abspath(sys.argv[0])] + sys.argv[1:]
+        relaunch_env = dict(os.environ)
+        relaunch_env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        if IS_WINDOWS:
+            script_path = write_restart_script(executable, args, os.getpid())
+            subprocess.Popen(
+                ["cmd.exe", "/c", script_path],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                cwd=BASE_DIR,
+                env=relaunch_env,
+            )
+            return True
+        subprocess.Popen([executable] + args, cwd=BASE_DIR, env=relaunch_env)
+        return True
+    except Exception:
+        return False
+
+
 def bytes_to_readable(num):
     try:
         num = float(num)
@@ -291,12 +374,6 @@ def live_clock_value(epoch=None):
     if epoch is None:
         epoch = datetime.now().timestamp()
     return {"live": "clock", "epoch": epoch}
-
-
-def is_virtual_display(name):
-    if not name:
-        return False
-    return "virtual desktop monitor" in name.lower()
 
 
 def wmi_connect(namespace=None):
@@ -377,6 +454,17 @@ def is_placeholder_value(text):
     return str(text).strip().lower() in PLACEHOLDER_WMI_VALUES
 
 
+MEMORY_TYPE_LABELS = {20: "DDR", 21: "DDR2", 24: "DDR3", 26: "DDR4", 34: "DDR5"}
+
+DISK_MEDIA_TYPE_LABELS = {0: "Unknown", 3: "HDD", 4: "SSD", 5: "SCM"}
+
+DISK_BUS_TYPE_LABELS = {
+    1: "SCSI", 2: "ATAPI", 3: "ATA", 4: "1394", 5: "SSA", 6: "Fibre Channel",
+    7: "USB", 8: "RAID", 9: "iSCSI", 10: "SAS", 11: "SATA", 12: "SD",
+    13: "MMC", 14: "Virtual", 15: "File Backed Virtual", 16: "Storage Spaces", 17: "NVMe",
+}
+
+
 def wmi_attr(obj, attr, fallback="N/A"):
     if obj is None:
         return fallback
@@ -390,9 +478,9 @@ def wmi_attr(obj, attr, fallback="N/A"):
 
 
 def get_gpu_vram_registry():
-    sizes = []
+    entries = []
     if not IS_WINDOWS:
-        return sizes
+        return entries
     try:
         import winreg
         base_path = r"SYSTEM\CurrentControlSet\Control\Video"
@@ -406,16 +494,37 @@ def get_gpu_vram_registry():
                 index += 1
                 if not guid.startswith("{"):
                     continue
-                try:
-                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, f"{base_path}\\{guid}\\0000") as sub_key:
-                        value, _ = winreg.QueryValueEx(sub_key, "HardwareInformation.qwMemorySize")
-                        if isinstance(value, int) and value > 0:
-                            sizes.append(int(value))
-                except OSError:
-                    continue
+                sub_index = 0
+                while True:
+                    sub_path = f"{base_path}\\{guid}\\{sub_index:04d}"
+                    try:
+                        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, sub_path) as sub_key:
+                            try:
+                                size_value, _ = winreg.QueryValueEx(sub_key, "HardwareInformation.qwMemorySize")
+                            except OSError:
+                                size_value = None
+                            try:
+                                desc_value, _ = winreg.QueryValueEx(sub_key, "DriverDesc")
+                            except OSError:
+                                desc_value = None
+                    except OSError:
+                        break
+                    sub_index += 1
+                    if isinstance(size_value, int) and size_value > 0 and desc_value:
+                        entries.append((str(desc_value).strip(), int(size_value)))
     except Exception:
         pass
-    return sizes
+    return entries
+
+
+def match_registry_vram(name, registry_groups):
+    if not name or name == "N/A":
+        return None
+    key = name.strip().lower()
+    bucket = registry_groups.get(key)
+    if not bucket:
+        return None
+    return bucket.pop(0)
 
 
 def normalize_vram_bytes(adapter_ram):
@@ -430,12 +539,17 @@ def normalize_vram_bytes(adapter_ram):
     return value if value > 0 else None
 
 
-def collect_gpu_details():
+def collect_gpu_details(conn=None):
     details = []
     try:
-        gpus = [g for g in wmi_all(wmi_connect(), "Win32_VideoController") if not is_virtual_display(safe(g.Name))]
-        registry_vram = get_gpu_vram_registry()
-        for idx, gpu in enumerate(gpus):
+        gpus = list(wmi_all(conn or wmi_connect(), "Win32_VideoController"))
+        registry_groups = {}
+        for desc, size in get_gpu_vram_registry():
+            key = desc.strip().lower()
+            registry_groups.setdefault(key, []).append(size)
+        for bucket in registry_groups.values():
+            bucket.sort(reverse=True)
+        for gpu in gpus:
             try:
                 name = wmi_attr(gpu, "Name")
                 driver = wmi_attr(gpu, "DriverVersion")
@@ -443,8 +557,9 @@ def collect_gpu_details():
                 vertical = wmi_attr(gpu, "CurrentVerticalResolution")
                 refresh = wmi_attr(gpu, "CurrentRefreshRate")
                 vram = normalize_vram_bytes(gpu.AdapterRAM)
-                if idx < len(registry_vram) and registry_vram[idx] > (vram or 0):
-                    vram = registry_vram[idx]
+                registry_vram = match_registry_vram(name, registry_groups)
+                if registry_vram is not None and registry_vram > (vram or 0):
+                    vram = registry_vram
                 vram_text = bytes_to_readable(vram) if vram else "N/A"
                 fields = (name, vram_text, driver, horizontal, vertical, refresh)
                 if any(field == "N/A" for field in fields):
@@ -516,7 +631,7 @@ def collect_ram_names(conn=None):
 def get_overview():
     conn = wmi_connect()
     cpu_name = get_cpu_name(conn)
-    gpu_names = [gpu["Name"] for gpu in collect_gpu_details()]
+    gpu_names = [gpu["Name"] for gpu in collect_gpu_details(conn)]
     motherboard_name = get_motherboard_name(conn)
     ram_name = format_counted_names(collect_ram_names(conn))
     os_info = wmi_first(conn, "Win32_OperatingSystem")
@@ -606,6 +721,36 @@ def get_motherboard():
     return {"General": general, "BIOS": bios}
 
 
+def get_cpu_cache_sizes(conn, cpu):
+    l1_bytes = l2_bytes = l3_bytes = 0
+    try:
+        for cache in wmi_all(conn, "Win32_CacheMemory"):
+            level = int(getattr(cache, "Level", 0) or 0)
+            size = getattr(cache, "MaxCacheSize", None) or getattr(cache, "InstalledSize", None)
+            if not size:
+                continue
+            size_bytes = int(size) * 1024
+            if level == 3:
+                l1_bytes += size_bytes
+            elif level == 4:
+                l2_bytes += size_bytes
+            elif level == 5:
+                l3_bytes += size_bytes
+    except Exception:
+        pass
+    if not l2_bytes and cpu is not None:
+        try:
+            l2_bytes = int(cpu.L2CacheSize) * 1024 if cpu.L2CacheSize else 0
+        except Exception:
+            pass
+    if not l3_bytes and cpu is not None:
+        try:
+            l3_bytes = int(cpu.L3CacheSize) * 1024 if cpu.L3CacheSize else 0
+        except Exception:
+            pass
+    return l1_bytes, l2_bytes, l3_bytes
+
+
 def get_processor():
     conn = wmi_connect()
     cpu = wmi_first(conn, "Win32_Processor")
@@ -614,35 +759,7 @@ def get_processor():
     threads = wmi_attr(cpu, "ThreadCount")
     if threads == "N/A":
         threads = safe(psutil.cpu_count(logical=True))
-    l1_bytes = 0
-    l2_bytes = 0
-    l3_bytes = 0
-    if cpu is not None:
-        try:
-            for cache in wmi_all(conn, "Win32_CacheMemory"):
-                level = int(getattr(cache, "Level", 0) or 0)
-                size = getattr(cache, "MaxCacheSize", None) or getattr(cache, "InstalledSize", None)
-                if not size:
-                    continue
-                size_bytes = int(size) * 1024
-                if level == 3:
-                    l1_bytes += size_bytes
-                elif level == 4:
-                    l2_bytes += size_bytes
-                elif level == 5:
-                    l3_bytes += size_bytes
-        except Exception:
-            pass
-        if not l2_bytes:
-            try:
-                l2_bytes = cpu.L2CacheSize * 1024 if cpu.L2CacheSize else 0
-            except Exception:
-                pass
-        if not l3_bytes:
-            try:
-                l3_bytes = cpu.L3CacheSize * 1024 if cpu.L3CacheSize else 0
-            except Exception:
-                pass
+    l1_bytes, l2_bytes, l3_bytes = get_cpu_cache_sizes(conn, cpu)
     general = {
         "Name": get_cpu_name(conn),
         "Manufacturer": manufacturer,
@@ -687,13 +804,12 @@ def get_memory():
         "Swap Used": bytes_to_readable(sm.used),
     }
     groups = {"General": general}
-    memory_type_labels = {20: "DDR", 21: "DDR2", 24: "DDR3", 26: "DDR4", 34: "DDR5"}
 
     def resolve_memory_type(mod):
-        label = memory_type_labels.get(getattr(mod, "SMBIOSMemoryType", None))
+        label = MEMORY_TYPE_LABELS.get(getattr(mod, "SMBIOSMemoryType", None))
         if label:
             return label
-        label = memory_type_labels.get(getattr(mod, "MemoryType", None))
+        label = MEMORY_TYPE_LABELS.get(getattr(mod, "MemoryType", None))
         return label or "Unknown"
 
     for idx, mod in enumerate(wmi_all(wmi_connect(), "Win32_PhysicalMemory")):
@@ -717,16 +833,10 @@ def get_disk_media_types():
     bus_types = {}
     try:
         storage = wmi_connect(namespace="root\\Microsoft\\Windows\\Storage")
-        media_labels = {0: "Unknown", 3: "HDD", 4: "SSD", 5: "SCM"}
-        bus_labels = {
-            1: "SCSI", 2: "ATAPI", 3: "ATA", 4: "1394", 5: "SSA", 6: "Fibre Channel",
-            7: "USB", 8: "RAID", 9: "iSCSI", 10: "SAS", 11: "SATA", 12: "SD",
-            13: "MMC", 15: "File Backed Virtual", 16: "Storage Spaces", 17: "NVMe",
-        }
         for disk in wmi_all(storage, "MSFT_PhysicalDisk"):
             device_id = str(disk.DeviceId)
-            media_types[device_id] = media_labels.get(disk.MediaType, "Unknown")
-            bus_label = bus_labels.get(getattr(disk, "BusType", None))
+            media_types[device_id] = DISK_MEDIA_TYPE_LABELS.get(disk.MediaType, "Unknown")
+            bus_label = DISK_BUS_TYPE_LABELS.get(getattr(disk, "BusType", None))
             if bus_label:
                 bus_types[device_id] = bus_label
     except Exception:
@@ -808,19 +918,22 @@ def get_storage():
 
 _nvidia_smi_available = None
 _nvidia_smi_lock = threading.Lock()
-_nvidia_smi_cache = {"timestamp": 0.0, "temps": {}}
 NVIDIA_SMI_CACHE_SECONDS = 2.0
+_nvidia_smi_cache = {
+    "temperature.gpu": {"timestamp": 0.0, "data": {}},
+    "utilization.gpu": {"timestamp": 0.0, "data": {}},
+}
 
 
-def _query_nvidia_gpu_temps():
-    gpu_temps = {}
+def _query_nvidia_smi(field):
     global _nvidia_smi_available
+    values = {}
     try:
         run_kwargs = {"capture_output": True, "text": True, "timeout": 3}
         if IS_WINDOWS:
             run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,temperature.gpu", "--format=csv,noheader,nounits"],
+            ["nvidia-smi", f"--query-gpu=name,{field}", "--format=csv,noheader,nounits"],
             **run_kwargs,
         )
         _nvidia_smi_available = True
@@ -828,65 +941,34 @@ def _query_nvidia_gpu_temps():
             for line in result.stdout.strip().splitlines():
                 parts = [p.strip() for p in line.split(",")]
                 if len(parts) >= 2:
-                    gpu_temps[parts[0]] = f"{parts[1]} °C"
+                    values[parts[0]] = parts[1]
     except FileNotFoundError:
         _nvidia_smi_available = False
     except Exception:
         pass
-    return gpu_temps
+    return values
+
+
+def _cached_nvidia_smi(field):
+    if _nvidia_smi_available is False:
+        return {}
+    now = time.monotonic()
+    with _nvidia_smi_lock:
+        cache = _nvidia_smi_cache[field]
+        if now - cache["timestamp"] < NVIDIA_SMI_CACHE_SECONDS:
+            return dict(cache["data"])
+        data = _query_nvidia_smi(field)
+        cache["timestamp"] = now
+        cache["data"] = data
+        return dict(data)
 
 
 def get_nvidia_gpu_temps():
-    if _nvidia_smi_available is False:
-        return {}
-    now = time.monotonic()
-    with _nvidia_smi_lock:
-        if now - _nvidia_smi_cache["timestamp"] < NVIDIA_SMI_CACHE_SECONDS:
-            return dict(_nvidia_smi_cache["temps"])
-        temps = _query_nvidia_gpu_temps()
-        _nvidia_smi_cache["timestamp"] = now
-        _nvidia_smi_cache["temps"] = temps
-        return dict(temps)
-
-
-_nvidia_smi_usage_cache = {"timestamp": 0.0, "usage": {}}
-
-
-def _query_nvidia_gpu_usage():
-    gpu_usage = {}
-    global _nvidia_smi_available
-    try:
-        run_kwargs = {"capture_output": True, "text": True, "timeout": 3}
-        if IS_WINDOWS:
-            run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,utilization.gpu", "--format=csv,noheader,nounits"],
-            **run_kwargs,
-        )
-        _nvidia_smi_available = True
-        if result.returncode == 0 and result.stdout.strip():
-            for line in result.stdout.strip().splitlines():
-                parts = [p.strip() for p in line.split(",")]
-                if len(parts) >= 2:
-                    gpu_usage[parts[0]] = parts[1]
-    except FileNotFoundError:
-        _nvidia_smi_available = False
-    except Exception:
-        pass
-    return gpu_usage
+    return {name: f"{value} °C" for name, value in _cached_nvidia_smi("temperature.gpu").items()}
 
 
 def get_nvidia_gpu_usage():
-    if _nvidia_smi_available is False:
-        return {}
-    now = time.monotonic()
-    with _nvidia_smi_lock:
-        if now - _nvidia_smi_usage_cache["timestamp"] < NVIDIA_SMI_CACHE_SECONDS:
-            return dict(_nvidia_smi_usage_cache["usage"])
-        usage = _query_nvidia_gpu_usage()
-        _nvidia_smi_usage_cache["timestamp"] = now
-        _nvidia_smi_usage_cache["usage"] = usage
-        return dict(usage)
+    return _cached_nvidia_smi("utilization.gpu")
 
 
 def get_overview_gpu_usage():
@@ -905,7 +987,8 @@ def get_overview_gpu_usage():
 def get_temperatures():
     cpu_group = {}
     other_group = {}
-    cpu_name = get_cpu_name()
+    conn = wmi_connect()
+    cpu_name = get_cpu_name(conn)
     zones = wmi_all(wmi_connect(namespace="root\\wmi"), "MSAcpi_ThermalZoneTemperature")
     for idx, zone in enumerate(zones):
         try:
@@ -917,7 +1000,7 @@ def get_temperatures():
             continue
     gpu_group = get_nvidia_gpu_temps()
     if not gpu_group:
-        for gpu in collect_gpu_details():
+        for gpu in collect_gpu_details(conn):
             gpu_group[gpu["Name"]] = "N/A"
     if hasattr(psutil, "sensors_temperatures"):
         try:
@@ -1165,35 +1248,45 @@ PROVIDERS = {
 }
 
 
-class InfoWorker(QThread):
-    finishedData = pyqtSignal(str, str)
-    failed = pyqtSignal(str, str)
+class DetectionWorker(QObject):
+    resultReady = pyqtSignal(str, str)
+    resultFailed = pyqtSignal(str, str)
 
     def __init__(self, category):
         super().__init__()
         self.category = category
+        self._com_ready = False
 
-    def run(self):
-        com_module = None
-        if IS_WINDOWS:
-            try:
-                import pythoncom
-                pythoncom.CoInitialize()
-                com_module = pythoncom
-            except Exception:
-                com_module = None
+    def _ensure_com(self):
+        if not IS_WINDOWS or self._com_ready:
+            return
         try:
-            func = PROVIDERS.get(self.category)
+            import pythoncom
+            pythoncom.CoInitialize()
+            self._com_ready = True
+        except Exception:
+            pass
+
+    @pyqtSlot()
+    def process(self):
+        self._ensure_com()
+        func = PROVIDERS.get(self.category)
+        try:
             result = func() if func else {}
-            self.finishedData.emit(self.category, json.dumps(result))
+            self.resultReady.emit(self.category, json.dumps(result))
         except Exception as exc:
-            self.failed.emit(self.category, str(exc))
-        finally:
-            if com_module is not None:
-                try:
-                    com_module.CoUninitialize()
-                except Exception:
-                    pass
+            self.resultFailed.emit(self.category, str(exc))
+
+    @pyqtSlot()
+    def teardown(self):
+        if not self._com_ready:
+            return
+        try:
+            import pythoncom
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+        self._com_ready = False
 
 
 class UpdateCheckWorker(QThread):
@@ -1329,6 +1422,8 @@ class Bridge(QObject):
     updateDownloadError = pyqtSignal(str)
     windowMaximizedChanged = pyqtSignal(bool)
     windowMinimizedChanged = pyqtSignal(bool)
+    settingsExported = pyqtSignal(bool, str)
+    settingsImported = pyqtSignal(bool, str)
 
     EDGE_FLAGS = {
         "top": Qt.Edge.TopEdge,
@@ -1340,40 +1435,57 @@ class Bridge(QObject):
     def __init__(self, window):
         super().__init__()
         self.window = window
-        self.workers = {}
-        self.pending_categories = set()
         self.update_worker = None
         self.download_worker = None
+        self._category_threads = {}
+        self._category_workers = {}
+        self._category_busy = set()
+        self._category_pending = set()
+        self._restart_pending = False
+        self._start_category_workers()
+
+    def _start_category_workers(self):
+        for category in PROVIDERS:
+            thread = QThread(self)
+            worker = DetectionWorker(category)
+            worker.moveToThread(thread)
+            worker.resultReady.connect(self._onFinished)
+            worker.resultFailed.connect(self._onFailed)
+            thread.start()
+            self._category_threads[category] = thread
+            self._category_workers[category] = worker
+
+    def shutdownCategoryWorkers(self):
+        for category, worker in self._category_workers.items():
+            QMetaObject.invokeMethod(worker, "teardown", Qt.ConnectionType.BlockingQueuedConnection)
+        for thread in self._category_threads.values():
+            thread.quit()
+            thread.wait(2000)
 
     @pyqtSlot(str)
     def requestCategory(self, category):
-        if category not in PROVIDERS:
+        worker = self._category_workers.get(category)
+        if worker is None:
             return
-        existing = self.workers.get(category)
-        if existing and existing.isRunning():
-            self.pending_categories.add(category)
+        if category in self._category_busy:
+            self._category_pending.add(category)
             return
-        self._startCategoryWorker(category)
-
-    def _startCategoryWorker(self, category):
-        worker = InfoWorker(category)
-        worker.finishedData.connect(self._onFinished)
-        worker.failed.connect(self._onFailed)
-        worker.finished.connect(lambda c=category: self._onWorkerFinished(c))
-        self.workers[category] = worker
-        worker.start()
-
-    def _onWorkerFinished(self, category):
-        self.workers.pop(category, None)
-        if category in self.pending_categories:
-            self.pending_categories.discard(category)
-            self._startCategoryWorker(category)
+        self._category_busy.add(category)
+        QMetaObject.invokeMethod(worker, "process", Qt.ConnectionType.QueuedConnection)
 
     def _onFinished(self, category, payload):
+        self._category_busy.discard(category)
         self.categoryData.emit(category, payload)
+        if category in self._category_pending:
+            self._category_pending.discard(category)
+            self.requestCategory(category)
 
     def _onFailed(self, category, message):
+        self._category_busy.discard(category)
         self.categoryError.emit(category, message)
+        if category in self._category_pending:
+            self._category_pending.discard(category)
+            self.requestCategory(category)
 
     @pyqtSlot()
     def checkForUpdates(self):
@@ -1455,6 +1567,47 @@ class Bridge(QObject):
             self.restartRequired.emit()
 
     @pyqtSlot()
+    def exportSettings(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self.window, "Export Settings", "sys_io_settings.json", "JSON Files (*.json)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(SETTINGS, f, indent=2)
+            self.settingsExported.emit(True, path)
+        except Exception as exc:
+            self.settingsExported.emit(False, str(exc))
+
+    @pyqtSlot()
+    def importSettings(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self.window, "Import Settings", "", "JSON Files (*.json)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception as exc:
+            self.settingsImported.emit(False, str(exc))
+            return
+        filtered = validate_imported_settings(raw)
+        if not filtered:
+            self.settingsImported.emit(False, "No valid settings found in file.")
+            return
+        changed_restart_keys = any(
+            key in RESTART_REQUIRED_KEYS and SETTINGS.get(key) != value
+            for key, value in filtered.items()
+        )
+        SETTINGS.update(filtered)
+        save_settings(SETTINGS)
+        self.settingsImported.emit(True, json.dumps(SETTINGS))
+        if changed_restart_keys:
+            self.restartRequired.emit()
+
+    @pyqtSlot()
     def startMove(self):
         handle = self.window.windowHandle()
         if handle:
@@ -1493,14 +1646,19 @@ class Bridge(QObject):
 
     @pyqtSlot()
     def restartApp(self):
+        relaunch_self()
         QApplication.instance().quit()
+
+    @pyqtSlot()
+    def deferRestart(self):
+        self._restart_pending = True
 
     @pyqtSlot(str)
     def copyToClipboard(self, text):
         QApplication.clipboard().setText(text)
 
 
-HTML_TEMPLATE = '''<!DOCTYPE html>
+HTML = '''<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -2264,7 +2422,7 @@ body.window-maximized #boot-screen {
 <div id="restart-overlay">
   <div id="restart-modal">
     <div id="restart-modal-title">Restart Required</div>
-    <div id="restart-modal-desc">This change needs the app to be closed and started again manually before it becomes active.</div>
+    <div id="restart-modal-desc">This change needs the app to restart before it becomes active.</div>
     <div id="restart-modal-actions">
       <button id="restart-later">Restart Later</button>
       <button id="restart-now">Restart Now</button>
@@ -2431,6 +2589,7 @@ function setupRestartModal() {
   document.getElementById("restart-later").addEventListener("click", (e) => {
     spawnRipple(e, e.currentTarget);
     hideRestartNotice();
+    if (bridge) bridge.deferRestart();
   });
   document.getElementById("restart-now").addEventListener("click", (e) => {
     spawnRipple(e, e.currentTarget);
@@ -3008,6 +3167,34 @@ function renderSettings() {
   applyUpdateCheckState();
 
   grid.appendChild(privSection);
+
+  const backupSection = document.createElement("div");
+  backupSection.className = "group-section";
+  backupSection.appendChild(createGroupHeading("Backup"));
+  const backupRow = buildSettingRow("Export / Import Settings", "Save your current settings to a file, or load them from a previously exported file.");
+  const backupWrap = document.createElement("div");
+  backupWrap.className = "update-check";
+  const exportBtn = document.createElement("button");
+  exportBtn.type = "button";
+  exportBtn.className = "update-check-btn";
+  exportBtn.textContent = "Export Settings";
+  exportBtn.addEventListener("click", (e) => {
+    spawnRipple(e, exportBtn);
+    startExportSettings();
+  });
+  const importBtn = document.createElement("button");
+  importBtn.type = "button";
+  importBtn.className = "update-check-btn";
+  importBtn.textContent = "Import Settings";
+  importBtn.addEventListener("click", (e) => {
+    spawnRipple(e, importBtn);
+    startImportSettings();
+  });
+  backupWrap.appendChild(exportBtn);
+  backupWrap.appendChild(importBtn);
+  backupRow.appendChild(backupWrap);
+  backupSection.appendChild(backupRow);
+  grid.appendChild(backupSection);
 }
 
 function formatBytes(num) {
@@ -3091,6 +3278,40 @@ function onUpdateDownloadReady() {
 function onUpdateDownloadError(message) {
   updateDownloadState = { status: "error", received: 0, total: 0 };
   applyUpdateCheckState();
+}
+
+function startExportSettings() {
+  if (bridge) bridge.exportSettings();
+}
+
+function startImportSettings() {
+  if (bridge) bridge.importSettings();
+}
+
+function onSettingsExported(success, info) {
+  showToast(success ? "Settings exported" : "Export failed");
+}
+
+function onSettingsImported(success, info) {
+  if (!success) {
+    showToast("Import failed");
+    return;
+  }
+  let parsed = null;
+  try {
+    parsed = JSON.parse(info);
+  } catch (err) {
+    showToast("Import failed");
+    return;
+  }
+  currentSettings = Object.assign({}, currentSettings, parsed);
+  document.documentElement.setAttribute("data-theme", resolveTheme(currentSettings.theme));
+  if (renderedCategory && Object.prototype.hasOwnProperty.call(loadedCache, renderedCategory)) {
+    renderData(renderedCategory, loadedCache[renderedCategory]);
+  }
+  if (appReady) restartAutoRefresh();
+  if (activeCategory === "settings") renderSettings();
+  showToast("Settings imported");
 }
 
 function applyUpdateCheckState() {
@@ -3187,6 +3408,8 @@ new QWebChannel(qt.webChannelTransport, (channel) => {
   bridge.updateDownloadError.connect(onUpdateDownloadError);
   bridge.windowMaximizedChanged.connect(onWindowMaximizedChanged);
   bridge.windowMinimizedChanged.connect(onWindowMinimizedChanged);
+  bridge.settingsExported.connect(onSettingsExported);
+  bridge.settingsImported.connect(onSettingsImported);
   buildSidebar();
   selectCategory("overview");
   requestAllCategories();
@@ -3198,7 +3421,7 @@ new QWebChannel(qt.webChannelTransport, (channel) => {
 
 
 def build_html():
-    html = HTML_TEMPLATE
+    html = HTML
     settings_payload = dict(SETTINGS)
     html = html.replace("__LOGO_URI__", LOGO_URI)
     html = html.replace("__SETTINGS_JSON__", json.dumps(settings_payload))
@@ -3284,6 +3507,9 @@ class MainWindow(QMainWindow):
             if is_min != self._was_minimized:
                 self._was_minimized = is_min
                 self.bridge.windowMinimizedChanged.emit(is_min)
+                if is_min and self.bridge._restart_pending:
+                    self.bridge._restart_pending = False
+                    QTimer.singleShot(150, self.bridge.restartApp)
             if not self.frameless:
                 self.bridge.windowMaximizedChanged.emit(self.isMaximized())
 
@@ -3333,6 +3559,7 @@ def main():
 
     window = MainWindow()
     window.show()
+    app.aboutToQuit.connect(window.bridge.shutdownCategoryWorkers)
 
     exit_code = app.exec()
     if IS_FROZEN:
