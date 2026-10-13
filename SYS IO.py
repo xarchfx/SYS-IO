@@ -80,7 +80,7 @@ def get_cpu_usage_snapshot():
 
 
 APP_NAME = "SYS IO"
-APP_VERSION = "0.0.6 (Beta)"
+APP_VERSION = "0.0.7 (Beta)"
 APP_AUTHOR = "Arch"
 APP_AUTHOR_HANDLE = "@xarchfx"
 APP_AUTHOR_URL = "https://xarchfx.lol"
@@ -3867,3 +3867,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
