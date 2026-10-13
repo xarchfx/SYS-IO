@@ -80,7 +80,7 @@ def get_cpu_usage_snapshot():
 
 
 APP_NAME = "SYS IO"
-APP_VERSION = "0.0.7 (Beta)"
+APP_VERSION = "0.0.8 (Beta)"
 APP_AUTHOR = "Arch"
 APP_AUTHOR_HANDLE = "@xarchfx"
 APP_AUTHOR_URL = "https://xarchfx.lol"
@@ -505,7 +505,11 @@ def wmi_attr(obj, attr, fallback="N/A"):
     return value
 
 
-def get_gpu_vram_registry():
+GPU_REGISTRY_CACHE_SECONDS = 30.0
+_gpu_registry_cache = {"timestamp": 0.0, "data": [], "lock": threading.Lock()}
+
+
+def _scan_gpu_vram_registry():
     entries = []
     if not IS_WINDOWS:
         return entries
@@ -543,6 +547,18 @@ def get_gpu_vram_registry():
     except Exception:
         pass
     return entries
+
+
+def get_gpu_vram_registry():
+    now = time.monotonic()
+    with _gpu_registry_cache["lock"]:
+        if now - _gpu_registry_cache["timestamp"] < GPU_REGISTRY_CACHE_SECONDS:
+            return list(_gpu_registry_cache["data"])
+    entries = _scan_gpu_vram_registry()
+    with _gpu_registry_cache["lock"]:
+        _gpu_registry_cache["timestamp"] = time.monotonic()
+        _gpu_registry_cache["data"] = entries
+    return list(entries)
 
 
 def match_registry_vram(name, registry_groups):
@@ -587,7 +603,23 @@ def get_gpu_adapter_ram(gpu):
         return None
 
 
+GPU_DETAILS_CACHE_SECONDS = 2.0
+_gpu_details_cache = {"timestamp": 0.0, "data": [], "lock": threading.Lock()}
+
+
 def collect_gpu_details(conn=None):
+    now = time.monotonic()
+    with _gpu_details_cache["lock"]:
+        if now - _gpu_details_cache["timestamp"] < GPU_DETAILS_CACHE_SECONDS:
+            return list(_gpu_details_cache["data"])
+    details = _scan_gpu_details(conn)
+    with _gpu_details_cache["lock"]:
+        _gpu_details_cache["timestamp"] = time.monotonic()
+        _gpu_details_cache["data"] = details
+    return list(details)
+
+
+def _scan_gpu_details(conn=None):
     details = []
     try:
         gpus = list(wmi_all(conn or wmi_connect(), "Win32_VideoController"))
@@ -1127,7 +1159,7 @@ _adl_malloc_callback = ADL_MAIN_MALLOC_CALLBACK(_adl_malloc)
 _adl_lock = threading.Lock()
 _adl_state = {"checked": False, "library": None}
 AMD_ADL_CACHE_SECONDS = 2.0
-_adl_cache = {"timestamp": 0.0, "data": {}}
+_adl_cache = {"timestamp": 0.0, "data": {}, "lock": threading.Lock()}
 
 
 def _load_adl_library():
@@ -1226,11 +1258,13 @@ def _query_amd_gpu_temperatures():
 
 def get_amd_gpu_temps():
     now = time.monotonic()
-    if now - _adl_cache["timestamp"] < AMD_ADL_CACHE_SECONDS:
-        return dict(_adl_cache["data"])
+    with _adl_cache["lock"]:
+        if now - _adl_cache["timestamp"] < AMD_ADL_CACHE_SECONDS:
+            return dict(_adl_cache["data"])
     data = _query_amd_gpu_temperatures()
-    _adl_cache["timestamp"] = now
-    _adl_cache["data"] = data
+    with _adl_cache["lock"]:
+        _adl_cache["timestamp"] = time.monotonic()
+        _adl_cache["data"] = data
     return dict(data)
 
 
@@ -2101,48 +2135,120 @@ body:not(.native-window) { background: transparent; }
   pointer-events: none;
 }
 .boot-logo-wrap {
-  width: 84px;
-  height: 84px;
+  width: 72px;
+  height: 72px;
   display: flex;
   align-items: center;
   justify-content: center;
-  margin-bottom: 22px;
+  margin-bottom: 18px;
+  filter: drop-shadow(0 6px 18px var(--shadow));
 }
 #boot-logo { max-width: 100%; max-height: 100%; }
 #boot-logo-fallback {
   display: none;
-  width: 84px;
-  height: 84px;
-  border-radius: 20px;
+  width: 72px;
+  height: 72px;
+  border-radius: 18px;
   background: var(--accent-soft);
   border: 1px solid var(--border);
   color: var(--accent);
-  font-size: 34px;
+  font-size: 30px;
   font-weight: 700;
   align-items: center;
   justify-content: center;
 }
-.boot-title { font-size: 22px; font-weight: 700; letter-spacing: 0.5px; color: var(--fg); }
-.boot-subtitle { font-size: 12.5px; color: var(--fg-dim); margin-top: 6px; letter-spacing: 0.3px; }
-.boot-progress {
-  width: 220px;
-  height: 4px;
-  background: var(--border);
-  border-radius: 2px;
+.boot-title { font-size: 20px; font-weight: 700; letter-spacing: 0.5px; color: var(--fg); }
+.boot-subtitle { font-size: 12px; color: var(--fg-dim); margin-top: 5px; letter-spacing: 0.3px; }
+.boot-panel {
+  width: 300px;
+  margin-top: 28px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+.boot-progress-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+#boot-current {
+  font-size: 12px;
+  color: var(--fg);
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  white-space: nowrap;
   overflow: hidden;
-  margin-top: 26px;
+  text-overflow: ellipsis;
+}
+#boot-percent {
+  font-size: 11.5px;
+  color: var(--accent);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  margin-left: 10px;
+}
+.boot-progress {
+  width: 100%;
+  height: 5px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+  position: relative;
 }
 .boot-progress-bar {
-  width: 40%;
+  width: 0%;
   height: 100%;
-  background: linear-gradient(90deg, transparent, var(--accent), transparent);
-  animation: boot-sweep 1.2s ease-in-out infinite;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width 0.35s cubic-bezier(0.4, 0, 0.2, 1);
 }
-@keyframes boot-sweep {
-  0% { transform: translateX(-120%); }
-  100% { transform: translateX(380%); }
+.boot-progress-bar::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.35), transparent);
+  width: 60px;
+  animation: boot-shimmer 1.4s ease-in-out infinite;
 }
-#boot-status { margin-top: 14px; font-size: 11.5px; color: var(--fg-dim); letter-spacing: 0.3px; }
+@keyframes boot-shimmer {
+  0% { transform: translateX(-80px); }
+  100% { transform: translateX(340px); }
+}
+#boot-eta {
+  margin-top: 9px;
+  font-size: 10.5px;
+  color: var(--fg-dim);
+  letter-spacing: 0.2px;
+}
+#boot-log {
+  margin-top: 18px;
+  width: 100%;
+  max-height: 118px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.boot-log-item {
+  font-size: 10.5px;
+  color: var(--fg-dim);
+  letter-spacing: 0.2px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  opacity: 0;
+  transform: translateY(4px);
+  animation: boot-log-in 0.3s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+.boot-log-item i {
+  color: var(--accent);
+  font-size: 9px;
+  flex: none;
+}
+@keyframes boot-log-in {
+  to { opacity: 1; transform: translateY(0); }
+}
 #app {
   position: fixed;
   inset: 0;
@@ -2151,9 +2257,15 @@ body:not(.native-window) { background: transparent; }
   opacity: 0;
   pointer-events: none;
   background: var(--bg);
-  transition: opacity 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+  transform: scale(0.97);
+  transition: opacity 0.5s cubic-bezier(0.4, 0, 0.2, 1), transform 0.5s cubic-bezier(0.34, 1.2, 0.64, 1);
 }
-#app.visible { opacity: 1; pointer-events: auto; }
+#app.visible { opacity: 1; pointer-events: auto; transform: scale(1); }
+@keyframes app-reveal-blur {
+  from { filter: blur(6px); }
+  to { filter: blur(0); }
+}
+#app.visible.reveal { animation: app-reveal-blur 0.5s cubic-bezier(0.4, 0, 0.2, 1); }
 body.native-window #titlebar { display: none; }
 body.native-window .resize-grip { display: none; }
 body:not(.native-window) #app,
@@ -2679,8 +2791,15 @@ body.window-maximized #boot-screen {
   </div>
   <div class="boot-title">__APP_NAME__</div>
   <div class="boot-subtitle">__APP_VERSION__</div>
-  <div class="boot-progress"><div class="boot-progress-bar"></div></div>
-  <div id="boot-status">Initializing...</div>
+  <div class="boot-panel">
+    <div class="boot-progress-row">
+      <span id="boot-current">Initializing...</span>
+      <span id="boot-percent">0%</span>
+    </div>
+    <div class="boot-progress"><div class="boot-progress-bar" id="boot-progress-bar"></div></div>
+    <div id="boot-eta"></div>
+    <div id="boot-log"></div>
+  </div>
 </div>
 <div id="app">
   <div id="titlebar">
@@ -2761,7 +2880,13 @@ let loadedCache = {};
 let bootMinTimeDone = false;
 let pendingBootCategories = new Set(CATEGORY_ORDER);
 let appReady = false;
-let bootMsgInterval = null;
+let bootStartTime = performance.now();
+let bootLoggedKeys = new Set();
+let bootCurrentEl = null;
+let bootPercentEl = null;
+let bootProgressBarEl = null;
+let bootEtaEl = null;
+let bootLogEl = null;
 let activeRefreshTimer = null;
 let backgroundRefreshTimer = null;
 let settingsLoadTimer = null;
@@ -2906,14 +3031,64 @@ function setupSidebarToggle() {
   });
 }
 
-function startBootMessages() {
-  const messages = ["Initializing core...", "Scanning hardware...", "Collecting system data...", "Finalizing..."];
-  let index = 0;
-  const el = document.getElementById("boot-status");
-  return setInterval(() => {
-    index = (index + 1) % messages.length;
-    el.textContent = messages[index];
-  }, 650);
+function bootLabelFor(key) {
+  return key === "settings" ? SETTINGS_META.label : (CATEGORY_META[key] ? CATEGORY_META[key].label : key);
+}
+
+function formatBootEta(seconds) {
+  if (!isFinite(seconds) || seconds <= 0) return "Almost done...";
+  if (seconds < 1) return "Almost done...";
+  return `About ${Math.ceil(seconds)}s remaining`;
+}
+
+function setupBootPanel() {
+  bootCurrentEl = document.getElementById("boot-current");
+  bootPercentEl = document.getElementById("boot-percent");
+  bootProgressBarEl = document.getElementById("boot-progress-bar");
+  bootEtaEl = document.getElementById("boot-eta");
+  bootLogEl = document.getElementById("boot-log");
+}
+
+function updateBootCurrentLabel() {
+  if (!bootCurrentEl) return;
+  const next = CATEGORY_ORDER.find((key) => pendingBootCategories.has(key));
+  bootCurrentEl.textContent = next ? `Loading ${bootLabelFor(next)}...` : "Finalizing...";
+}
+
+function addBootLogEntry(key, ok) {
+  if (bootLoggedKeys.has(key) || !bootLogEl) return;
+  bootLoggedKeys.add(key);
+  const row = document.createElement("div");
+  row.className = "boot-log-item";
+  const icon = document.createElement("i");
+  icon.className = ok ? "fa-solid fa-check" : "fa-solid fa-triangle-exclamation";
+  const text = document.createElement("span");
+  text.textContent = ok ? `${bootLabelFor(key)} loaded` : `${bootLabelFor(key)} failed`;
+  row.appendChild(icon);
+  row.appendChild(text);
+  bootLogEl.appendChild(row);
+  while (bootLogEl.children.length > 5) {
+    bootLogEl.removeChild(bootLogEl.firstChild);
+  }
+}
+
+function updateBootProgress() {
+  const total = CATEGORY_ORDER.length;
+  const loaded = total - pendingBootCategories.size;
+  const percent = total > 0 ? Math.round((loaded / total) * 100) : 100;
+  if (bootProgressBarEl) bootProgressBarEl.style.width = `${percent}%`;
+  if (bootPercentEl) bootPercentEl.textContent = `${percent}%`;
+  updateBootCurrentLabel();
+  if (bootEtaEl) {
+    if (loaded === 0 || loaded >= total) {
+      bootEtaEl.textContent = loaded >= total ? "" : "Estimating...";
+    } else {
+      const elapsedSeconds = (performance.now() - bootStartTime) / 1000;
+      const avgPerItem = elapsedSeconds / loaded;
+      const remaining = total - loaded;
+      bootEtaEl.textContent = formatBootEta(avgPerItem * remaining);
+    }
+  }
 }
 
 function requestAllCategories() {
@@ -2925,12 +3100,12 @@ function requestAllCategories() {
 function tryFinishBoot() {
   if (bootMinTimeDone && pendingBootCategories.size === 0 && !appReady) {
     appReady = true;
-    if (bootMsgInterval) clearInterval(bootMsgInterval);
     const boot = document.getElementById("boot-screen");
     const app = document.getElementById("app");
     boot.classList.add("boot-hide");
-    app.classList.add("visible");
+    app.classList.add("visible", "reveal");
     setTimeout(() => { boot.style.display = "none"; }, 500);
+    app.addEventListener("animationend", () => app.classList.remove("reveal"), { once: true });
     restartAutoRefresh();
   }
 }
@@ -3118,6 +3293,7 @@ function addHalloweenDecoration(card) {
 function renderSkeleton() {
   renderedCategory = null;
   renderedValueEls = null;
+  liveRegistry = {};
   setMiniLoaderVisible(true);
   const grid = document.getElementById("data-grid");
   grid.innerHTML = "";
@@ -3240,6 +3416,7 @@ function renderError(message) {
   setMiniLoaderVisible(false);
   renderedCategory = null;
   renderedValueEls = null;
+  liveRegistry = {};
   const grid = document.getElementById("data-grid");
   grid.innerHTML = "";
   const { section, subgrid } = createGroupSection();
@@ -3348,6 +3525,7 @@ function renderSettings() {
   setMiniLoaderVisible(false);
   renderedCategory = null;
   renderedValueEls = null;
+  liveRegistry = {};
   settingsRowIndex = 0;
   const grid = document.getElementById("data-grid");
   grid.innerHTML = "";
@@ -3576,6 +3754,8 @@ function onUpdateDownloadReady() {
 function onUpdateDownloadError(message) {
   updateDownloadState = { status: "error", received: 0, total: 0 };
   applyUpdateCheckState();
+  if (message) console.error("Update download failed:", message);
+  showToast("Update download failed");
 }
 
 function startExportSettings() {
@@ -3587,7 +3767,12 @@ function startImportSettings() {
 }
 
 function onSettingsExported(success, info) {
-  showToast(success ? "Settings exported" : "Export failed");
+  if (success) {
+    showToast("Settings exported");
+  } else {
+    console.error("Settings export failed:", info);
+    showToast("Export failed");
+  }
 }
 
 function onSettingsImported(success, info) {
@@ -3676,13 +3861,21 @@ function onCategoryData(category, payload) {
       renderData(category, payload);
     }
   }
-  pendingBootCategories.delete(category);
+  if (pendingBootCategories.has(category)) {
+    pendingBootCategories.delete(category);
+    addBootLogEntry(category, true);
+    updateBootProgress();
+  }
   tryFinishBoot();
 }
 
 function onCategoryError(category, message) {
   if (category === activeCategory) renderError(message);
-  pendingBootCategories.delete(category);
+  if (pendingBootCategories.has(category)) {
+    pendingBootCategories.delete(category);
+    addBootLogEntry(category, false);
+    updateBootProgress();
+  }
   tryFinishBoot();
 }
 
@@ -3692,7 +3885,8 @@ setupResizeGrips();
 setupTitlebar();
 setupSidebarToggle();
 setupRestartModal();
-bootMsgInterval = startBootMessages();
+setupBootPanel();
+updateBootProgress();
 setTimeout(() => { bootMinTimeDone = true; tryFinishBoot(); }, 900);
 
 new QWebChannel(qt.webChannelTransport, (channel) => {
@@ -3867,4 +4061,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
