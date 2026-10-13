@@ -80,7 +80,7 @@ def get_cpu_usage_snapshot():
 
 
 APP_NAME = "SYS IO"
-APP_VERSION = "0.0.5 (Beta)"
+APP_VERSION = "0.0.6 (Beta)"
 APP_AUTHOR = "Arch"
 APP_AUTHOR_HANDLE = "@xarchfx"
 APP_AUTHOR_URL = "https://xarchfx.lol"
@@ -376,13 +376,39 @@ def live_clock_value(epoch=None):
     return {"live": "clock", "epoch": epoch}
 
 
+_wmi_thread_local = threading.local()
+
+
+def _wmi_connection_cache():
+    cache = getattr(_wmi_thread_local, "connections", None)
+    if cache is None:
+        cache = {}
+        _wmi_thread_local.connections = cache
+    return cache
+
+
 def wmi_connect(namespace=None):
     if not (IS_WINDOWS and wmi):
         return None
+    cache = _wmi_connection_cache()
+    key = namespace or ""
+    if key in cache:
+        return cache[key]
     try:
-        return wmi.WMI(namespace=namespace) if namespace else wmi.WMI()
+        conn = wmi.WMI(namespace=namespace) if namespace else wmi.WMI()
     except Exception:
         return None
+    cache[key] = conn
+    return conn
+
+
+def _invalidate_wmi_connection(conn):
+    if conn is None:
+        return
+    cache = _wmi_connection_cache()
+    for key, cached in list(cache.items()):
+        if cached is conn:
+            del cache[key]
 
 
 def wmi_first(conn, class_name):
@@ -392,6 +418,7 @@ def wmi_first(conn, class_name):
         items = getattr(conn, class_name)()
         return items[0] if items else None
     except Exception:
+        _invalidate_wmi_connection(conn)
         return None
 
 
@@ -401,6 +428,7 @@ def wmi_all(conn, class_name):
     try:
         return list(getattr(conn, class_name)())
     except Exception:
+        _invalidate_wmi_connection(conn)
         return []
 
 
@@ -539,6 +567,26 @@ def normalize_vram_bytes(adapter_ram):
     return value if value > 0 else None
 
 
+GPU_IGNORED_NAME_SUBSTRINGS = (
+    "microsoft basic render driver",
+    "microsoft basic display adapter",
+    "microsoft remote display adapter",
+    "remote desktop",
+)
+
+
+def is_ignored_gpu_name(name):
+    lowered = name.strip().lower()
+    return any(token in lowered for token in GPU_IGNORED_NAME_SUBSTRINGS)
+
+
+def get_gpu_adapter_ram(gpu):
+    try:
+        return normalize_vram_bytes(gpu.AdapterRAM)
+    except Exception:
+        return None
+
+
 def collect_gpu_details(conn=None):
     details = []
     try:
@@ -552,24 +600,25 @@ def collect_gpu_details(conn=None):
         for gpu in gpus:
             try:
                 name = wmi_attr(gpu, "Name")
+                if name == "N/A" or is_ignored_gpu_name(name):
+                    continue
                 driver = wmi_attr(gpu, "DriverVersion")
                 horizontal = wmi_attr(gpu, "CurrentHorizontalResolution")
                 vertical = wmi_attr(gpu, "CurrentVerticalResolution")
                 refresh = wmi_attr(gpu, "CurrentRefreshRate")
-                vram = normalize_vram_bytes(gpu.AdapterRAM)
+                vram = get_gpu_adapter_ram(gpu)
                 registry_vram = match_registry_vram(name, registry_groups)
                 if registry_vram is not None and registry_vram > (vram or 0):
                     vram = registry_vram
                 vram_text = bytes_to_readable(vram) if vram else "N/A"
-                fields = (name, vram_text, driver, horizontal, vertical, refresh)
-                if any(field == "N/A" for field in fields):
-                    continue
+                resolution = f"{horizontal} x {vertical}" if "N/A" not in (horizontal, vertical) else "N/A"
+                refresh_text = f"{refresh} Hz" if refresh != "N/A" else "N/A"
                 details.append({
                     "Name": name,
                     "VRAM": vram_text,
                     "Driver Version": driver,
-                    "Resolution": f"{horizontal} x {vertical}",
-                    "Refresh Rate": f"{refresh} Hz",
+                    "Resolution": resolution,
+                    "Refresh Rate": refresh_text,
                 })
             except Exception:
                 continue
@@ -751,6 +800,46 @@ def get_cpu_cache_sizes(conn, cpu):
     return l1_bytes, l2_bytes, l3_bytes
 
 
+def get_live_cpu_frequency_mhz():
+    if not (IS_WINDOWS and wmi):
+        return None
+    conn = wmi_connect()
+    if conn is None:
+        return None
+    try:
+        perf = conn.Win32_PerfFormattedData_Counters_ProcessorInformation(Name="_Total")
+    except Exception:
+        _invalidate_wmi_connection(conn)
+        return None
+    if not perf:
+        return None
+    try:
+        percent = float(perf[0].PercentProcessorPerformance)
+    except Exception:
+        return None
+    cpu = wmi_first(conn, "Win32_Processor")
+    try:
+        max_mhz = float(getattr(cpu, "MaxClockSpeed", 0) or 0)
+    except Exception:
+        max_mhz = 0.0
+    if max_mhz <= 0 or percent <= 0:
+        return None
+    return max_mhz * percent / 100.0
+
+
+def get_cpu_frequency_text():
+    live_mhz = get_live_cpu_frequency_mhz()
+    if live_mhz:
+        return f"{live_mhz / 1000:.2f} GHz"
+    try:
+        freq = psutil.cpu_freq()
+    except Exception:
+        freq = None
+    if not freq or not freq.current:
+        return "N/A"
+    return f"{freq.current / 1000:.2f} GHz"
+
+
 def get_processor():
     conn = wmi_connect()
     cpu = wmi_first(conn, "Win32_Processor")
@@ -773,7 +862,7 @@ def get_processor():
         "L3 Cache": bytes_to_readable(l3_bytes) if l3_bytes else "N/A",
     }
     total_cpu, per_core = get_cpu_usage_snapshot()
-    usage = {"Total Usage": f"{total_cpu:.1f}%"}
+    usage = {"Total Usage": f"{total_cpu:.1f}%", "Frequency": get_cpu_frequency_text()}
     cores = {}
     for idx, core_usage in enumerate(per_core):
         cores[f"Core {idx + 1}"] = f"{core_usage:.1f}%"
@@ -783,6 +872,10 @@ def get_processor():
 def get_graphics():
     groups = {}
     collected = collect_gpu_details()
+    collected = sorted(
+        collected,
+        key=lambda entry: any(value == "N/A" for value in entry.values()),
+    )
     multiple = len(collected) > 1
     for idx, entry in enumerate(collected):
         label = f"GPU {idx + 1}" if multiple else "GPU"
@@ -916,17 +1009,16 @@ def get_storage():
     return groups
 
 
-_nvidia_smi_available = None
-_nvidia_smi_lock = threading.Lock()
+_nvidia_smi_available = True
+_nvidia_smi_availability_lock = threading.Lock()
 NVIDIA_SMI_CACHE_SECONDS = 2.0
 _nvidia_smi_cache = {
-    "temperature.gpu": {"timestamp": 0.0, "data": {}},
-    "utilization.gpu": {"timestamp": 0.0, "data": {}},
+    "temperature.gpu": {"timestamp": 0.0, "data": {}, "lock": threading.Lock()},
+    "utilization.gpu": {"timestamp": 0.0, "data": {}, "lock": threading.Lock()},
 }
 
 
 def _query_nvidia_smi(field):
-    global _nvidia_smi_available
     values = {}
     try:
         run_kwargs = {"capture_output": True, "text": True, "timeout": 3}
@@ -936,31 +1028,36 @@ def _query_nvidia_smi(field):
             ["nvidia-smi", f"--query-gpu=name,{field}", "--format=csv,noheader,nounits"],
             **run_kwargs,
         )
-        _nvidia_smi_available = True
         if result.returncode == 0 and result.stdout.strip():
             for line in result.stdout.strip().splitlines():
                 parts = [p.strip() for p in line.split(",")]
                 if len(parts) >= 2:
                     values[parts[0]] = parts[1]
+        return values, True
     except FileNotFoundError:
-        _nvidia_smi_available = False
+        return values, False
     except Exception:
-        pass
-    return values
+        return values, True
 
 
 def _cached_nvidia_smi(field):
-    if _nvidia_smi_available is False:
-        return {}
-    now = time.monotonic()
-    with _nvidia_smi_lock:
-        cache = _nvidia_smi_cache[field]
-        if now - cache["timestamp"] < NVIDIA_SMI_CACHE_SECONDS:
-            return dict(cache["data"])
-        data = _query_nvidia_smi(field)
-        cache["timestamp"] = now
-        cache["data"] = data
-        return dict(data)
+    global _nvidia_smi_available
+    with _nvidia_smi_availability_lock:
+        if not _nvidia_smi_available:
+            return {}
+    entry = _nvidia_smi_cache[field]
+    with entry["lock"]:
+        now = time.monotonic()
+        if now - entry["timestamp"] < NVIDIA_SMI_CACHE_SECONDS:
+            return dict(entry["data"])
+        data, available = _query_nvidia_smi(field)
+        entry["timestamp"] = time.monotonic()
+        entry["data"] = data
+        result = dict(data)
+    if not available:
+        with _nvidia_smi_availability_lock:
+            _nvidia_smi_available = False
+    return result
 
 
 def get_nvidia_gpu_temps():
@@ -984,6 +1081,159 @@ def get_overview_gpu_usage():
     return f"{sum(values) / len(values):.1f}%"
 
 
+ADL_SUCCESS = 0
+ADL_MAX_PATH = 256
+
+
+class ADLAdapterInfo(ctypes.Structure):
+    _fields_ = [
+        ("iSize", ctypes.c_int),
+        ("iAdapterIndex", ctypes.c_int),
+        ("strUDID", ctypes.c_char * ADL_MAX_PATH),
+        ("iBusNumber", ctypes.c_int),
+        ("iDeviceNumber", ctypes.c_int),
+        ("iFunctionNumber", ctypes.c_int),
+        ("iVendorID", ctypes.c_int),
+        ("strAdapterName", ctypes.c_char * ADL_MAX_PATH),
+        ("strDisplayName", ctypes.c_char * ADL_MAX_PATH),
+        ("iPresent", ctypes.c_int),
+        ("iExist", ctypes.c_int),
+        ("strDriverPath", ctypes.c_char * ADL_MAX_PATH),
+        ("strDriverPathExt", ctypes.c_char * ADL_MAX_PATH),
+        ("strPNPString", ctypes.c_char * ADL_MAX_PATH),
+        ("iOSDisplayIndex", ctypes.c_int),
+    ]
+
+
+class ADLTemperature(ctypes.Structure):
+    _fields_ = [
+        ("iSize", ctypes.c_int),
+        ("iTemperature", ctypes.c_int),
+    ]
+
+
+ADL_MAIN_MALLOC_CALLBACK = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_int)
+_adl_allocations = []
+
+
+def _adl_malloc(size):
+    buf = ctypes.create_string_buffer(size)
+    _adl_allocations.append(buf)
+    return ctypes.cast(buf, ctypes.c_void_p).value
+
+
+_adl_malloc_callback = ADL_MAIN_MALLOC_CALLBACK(_adl_malloc)
+
+_adl_lock = threading.Lock()
+_adl_state = {"checked": False, "library": None}
+AMD_ADL_CACHE_SECONDS = 2.0
+_adl_cache = {"timestamp": 0.0, "data": {}}
+
+
+def _load_adl_library():
+    if not IS_WINDOWS:
+        return None
+    for name in ("atiadlxx.dll", "atiadlxy.dll"):
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            continue
+    return None
+
+
+def _init_adl():
+    with _adl_lock:
+        if _adl_state["checked"]:
+            return _adl_state["library"]
+        _adl_state["checked"] = True
+        library = _load_adl_library()
+        if library is None:
+            return None
+        try:
+            library.ADL_Main_Control_Create.argtypes = [ADL_MAIN_MALLOC_CALLBACK, ctypes.c_int]
+            library.ADL_Main_Control_Create.restype = ctypes.c_int
+            library.ADL_Adapter_NumberOfAdapters_Get.argtypes = [ctypes.POINTER(ctypes.c_int)]
+            library.ADL_Adapter_NumberOfAdapters_Get.restype = ctypes.c_int
+            library.ADL_Adapter_AdapterInfo_Get.argtypes = [ctypes.POINTER(ADLAdapterInfo), ctypes.c_int]
+            library.ADL_Adapter_AdapterInfo_Get.restype = ctypes.c_int
+            library.ADL_Adapter_Active_Get.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+            library.ADL_Adapter_Active_Get.restype = ctypes.c_int
+            library.ADL_Overdrive5_Temperature_Get.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ADLTemperature)]
+            library.ADL_Overdrive5_Temperature_Get.restype = ctypes.c_int
+            library.ADL_Overdrive6_Temperature_Get.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+            library.ADL_Overdrive6_Temperature_Get.restype = ctypes.c_int
+            if library.ADL_Main_Control_Create(_adl_malloc_callback, 1) != ADL_SUCCESS:
+                return None
+        except Exception:
+            return None
+        _adl_state["library"] = library
+        return library
+
+
+def _query_amd_adapter_temperature(library, index):
+    milli = ctypes.c_int(0)
+    try:
+        if library.ADL_Overdrive6_Temperature_Get(index, ctypes.byref(milli)) == ADL_SUCCESS and milli.value > 0:
+            return milli.value / 1000.0
+    except Exception:
+        pass
+    temp = ADLTemperature()
+    temp.iSize = ctypes.sizeof(ADLTemperature)
+    try:
+        if library.ADL_Overdrive5_Temperature_Get(index, 0, ctypes.byref(temp)) == ADL_SUCCESS and temp.iTemperature > 0:
+            return temp.iTemperature / 1000.0
+    except Exception:
+        pass
+    return None
+
+
+def _query_amd_gpu_temperatures():
+    library = _init_adl()
+    if library is None:
+        return {}
+    values = {}
+    try:
+        count = ctypes.c_int(0)
+        if library.ADL_Adapter_NumberOfAdapters_Get(ctypes.byref(count)) != ADL_SUCCESS or count.value <= 0:
+            return {}
+        infos = (ADLAdapterInfo * count.value)()
+        for info in infos:
+            info.iSize = ctypes.sizeof(ADLAdapterInfo)
+        total_size = ctypes.sizeof(ADLAdapterInfo) * count.value
+        if library.ADL_Adapter_AdapterInfo_Get(infos, total_size) != ADL_SUCCESS:
+            return {}
+        for info in infos:
+            try:
+                active = ctypes.c_int(0)
+                if library.ADL_Adapter_Active_Get(info.iAdapterIndex, ctypes.byref(active)) != ADL_SUCCESS:
+                    continue
+                if not active.value:
+                    continue
+                name = info.strAdapterName.decode("utf-8", "ignore").strip()
+                if not name or name in values:
+                    continue
+                celsius = _query_amd_adapter_temperature(library, info.iAdapterIndex)
+                if celsius is not None:
+                    values[name] = celsius
+            except Exception:
+                continue
+    except Exception:
+        return {}
+    finally:
+        del _adl_allocations[:]
+    return values
+
+
+def get_amd_gpu_temps():
+    now = time.monotonic()
+    if now - _adl_cache["timestamp"] < AMD_ADL_CACHE_SECONDS:
+        return dict(_adl_cache["data"])
+    data = _query_amd_gpu_temperatures()
+    _adl_cache["timestamp"] = now
+    _adl_cache["data"] = data
+    return dict(data)
+
+
 def get_temperatures():
     cpu_group = {}
     other_group = {}
@@ -998,10 +1248,16 @@ def get_temperatures():
             cpu_group[label] = f"{celsius:.1f} °C"
         except Exception:
             continue
-    gpu_group = get_nvidia_gpu_temps()
-    if not gpu_group:
-        for gpu in collect_gpu_details(conn):
-            gpu_group[gpu["Name"]] = "N/A"
+    combined_gpu_temps = get_nvidia_gpu_temps()
+    for name, celsius in get_amd_gpu_temps().items():
+        combined_gpu_temps.setdefault(name, f"{celsius:.1f} °C")
+    known_gpu_names = [gpu["Name"] for gpu in collect_gpu_details(conn)]
+    gpu_group = {}
+    for name in known_gpu_names:
+        if name in combined_gpu_temps:
+            gpu_group[name] = combined_gpu_temps[name]
+    for name, value in combined_gpu_temps.items():
+        gpu_group.setdefault(name, value)
     if hasattr(psutil, "sensors_temperatures"):
         try:
             temps = psutil.sensors_temperatures()
@@ -1018,6 +1274,11 @@ def get_temperatures():
         groups["GPU"] = gpu_group
     if other_group:
         groups["Other Sensors"] = other_group
+    groups = {
+        group_name: {k: v for k, v in fields.items() if v != "N/A"}
+        for group_name, fields in groups.items()
+    }
+    groups = {group_name: fields for group_name, fields in groups.items() if fields}
     if not groups:
         groups["Status"] = {"Sensors": "No temperature sensors detected"}
     return groups
@@ -1060,6 +1321,23 @@ def get_volume_serial(drive="C:\\"):
         return "N/A"
 
 
+def get_interface_ipv4(iface_addrs):
+    for entry in iface_addrs:
+        if getattr(entry, "family", None) == socket.AF_INET:
+            return entry.address
+    return None
+
+
+def get_interface_mac(iface_addrs):
+    mac = None
+    for entry in iface_addrs:
+        family = getattr(entry, "family", None)
+        is_link = family == psutil.AF_LINK or str(family).endswith("AF_LINK")
+        if is_link and entry.address and entry.address not in ("00:00:00:00:00:00", ""):
+            mac = entry.address.upper()
+    return mac
+
+
 def get_network():
     try:
         addrs = psutil.net_if_addrs()
@@ -1075,15 +1353,8 @@ def get_network():
         counters = {}
     entries = []
     for iface, iface_addrs in addrs.items():
-        ipv4 = "N/A"
-        mac = "N/A"
-        for entry in iface_addrs:
-            family = getattr(entry, "family", None)
-            if family == socket.AF_INET:
-                ipv4 = entry.address
-            is_link = family == psutil.AF_LINK or str(family).endswith("AF_LINK")
-            if is_link and entry.address and entry.address not in ("00:00:00:00:00:00", ""):
-                mac = entry.address.upper()
+        ipv4 = get_interface_ipv4(iface_addrs)
+        mac = get_interface_mac(iface_addrs)
         stat = stats.get(iface)
         counter = counters.get(iface)
         is_up = stat is not None and stat.isup
@@ -1105,8 +1376,35 @@ def get_network():
     return groups
 
 
+def get_primary_mac_address():
+    try:
+        addrs = psutil.net_if_addrs()
+    except Exception:
+        return None
+    try:
+        stats = psutil.net_if_stats()
+    except Exception:
+        stats = {}
+    candidates = []
+    for iface, iface_addrs in addrs.items():
+        mac = get_interface_mac(iface_addrs)
+        if not mac:
+            continue
+        stat = stats.get(iface)
+        is_up = bool(stat is not None and stat.isup)
+        candidates.append((is_up, mac))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: not item[0])
+    return candidates[0][1]
+
+
+def get_fallback_mac_address():
+    return ":".join(["{:02x}".format((uuid.getnode() >> ele) & 0xff) for ele in range(40, -1, -8)]).upper()
+
+
 def get_hardware_ids():
-    mac = ":".join(["{:02x}".format((uuid.getnode() >> ele) & 0xff) for ele in range(40, -1, -8)]).upper()
+    mac = get_primary_mac_address() or get_fallback_mac_address()
     groups = {"General": {"MAC Address": mac, "Machine GUID": get_machine_guid()}}
     conn = wmi_connect()
     cpu = wmi_first(conn, "Win32_Processor")
